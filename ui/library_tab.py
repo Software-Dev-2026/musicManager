@@ -490,6 +490,16 @@ class LibraryTab(QWidget):
                 result[key] = widget.isChecked()
         return result
 
+    def _prune_empty_dirs(self, directory: Path):
+        music_dir = self.config.music_dir.resolve()
+        path = directory.resolve()
+        while path != music_dir and path.is_relative_to(music_dir):
+            try:
+                path.rmdir()  # fails (OSError) if not empty — no iterdir needed
+            except OSError:
+                break
+            path = path.parent
+
     def _dest_path(self, current: Path, tags: dict) -> Path:
         music_dir = self.config.music_dir
         structure = self.config.library_structure
@@ -531,6 +541,7 @@ class LibraryTab(QWidget):
             shutil.move(str(current), str(dest))
             self._current_file = str(dest)
             self._file_label.setText(str(dest))
+            self._prune_empty_dirs(current.parent)
         except Exception as e:
             QMessageBox.warning(self, "Saved (Move Failed)",
                                 f"Tags saved but could not move file:\n{e}")

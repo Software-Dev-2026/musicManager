@@ -261,12 +261,16 @@ class DuplicatesTab(QWidget):
             self._progress_bar.setValue(current)
         if current > 0 and total > 0:
             elapsed = time.monotonic() - self._scan_start
-            remaining = elapsed / current * (total - current)
+            remaining = int(elapsed / current * (total - current))
             if remaining < 60:
-                eta_text = f"~{int(remaining)}s remaining"
-            else:
-                m, s = divmod(int(remaining), 60)
+                eta_text = f"~{remaining}s remaining"
+            elif remaining < 3600:
+                m, s = divmod(remaining, 60)
                 eta_text = f"~{m}m {s}s remaining"
+            else:
+                h, r = divmod(remaining, 3600)
+                m, s = divmod(r, 60)
+                eta_text = f"~{h}h {m}m {s}s remaining"
             self._eta_label.setText(eta_text)
 
     def _on_done(self, groups: list):
@@ -333,8 +337,34 @@ class DuplicatesTab(QWidget):
         else:
             self._auto_select_btn.setToolTip("First run: configure which directories are low-priority, then apply")
 
+    def _rerank_all(self):
+        if not self._groups:
+            return
+        priority_dirs = list(self.config.dupes_priority_dirs)
+        self._results.blockSignals(True)
+        for i, group in enumerate(self._groups):
+            group_item = self._results.topLevelItem(i)
+            if not group_item:
+                continue
+            ranked = rank_group(group, self.config.music_dir, priority_dirs)
+            rank_map = {p: r for p, r in ranked}
+            n = len(ranked)
+            for j in range(group_item.childCount()):
+                child = group_item.child(j)
+                path = Path(child.data(0, Qt.ItemDataRole.UserRole) or "")
+                rank = rank_map.get(path, j + 1)
+                child.setText(3, f"#{rank} of {n}")
+                if rank == 1:
+                    child.setForeground(3, QColor(COLORS["success"]))
+                elif rank == n:
+                    child.setForeground(3, QColor(COLORS["error"]))
+                else:
+                    child.setForeground(3, QColor(COLORS["warning"]))
+        self._results.blockSignals(False)
+
     def refresh_from_config(self):
         self._refresh_auto_select_label()
+        self._rerank_all()
 
     def _auto_select(self):
         configured = self.config.get("dupes_priority_configured", False)
@@ -346,6 +376,7 @@ class DuplicatesTab(QWidget):
             self.config.set("dupes_priority_configured", True)
             self.config.save()
             self._refresh_auto_select_label()
+            self._rerank_all()
 
         priority_dirs = list(self.config.dupes_priority_dirs)
         for i, group in enumerate(self._groups):
