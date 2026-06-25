@@ -144,6 +144,22 @@ class _ScanThread(QThread):
                         singles.append((title, str(child), missing))
 
             results.append((artist_dir.name, albums, singles))
+
+        misc = []
+        for item in sorted(self.music_dir.iterdir()):
+            if self._cancelled:
+                return
+            if item.is_file() and item.suffix.lower() in self.extensions:
+                title, _, missing = self._meta(item)
+                misc.append((title, str(item), missing))
+        if misc:
+            for idx, (name, albums, singles) in enumerate(results):
+                if name == "Misc":
+                    results[idx] = ("Misc", albums, singles + misc)
+                    break
+            else:
+                results.append(("Misc", [], misc))
+
         self.done.emit(results)
 
 
@@ -478,7 +494,7 @@ class LibraryTab(QWidget):
         org_layout = QVBoxLayout(org_box)
         org_desc = QLabel(
             "Reads the artist and album tags from each file and moves it into the matching "
-            "folder structure.\n"
+            "folder structure. Files with no artist tag are moved to an Unknown folder.\n"
             "Does not edit any tags."
         )
         org_desc.setObjectName("muted")
@@ -685,7 +701,7 @@ class LibraryTab(QWidget):
         reply = QMessageBox.question(
             self, "Organize Files by Tags",
             "This will move files into folders based on their artist and album tags.\n"
-            "Files with no artist tag will be skipped.\n\n"
+            "Files with no artist tag will be moved to an Unknown folder.\n\n"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )

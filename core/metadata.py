@@ -38,7 +38,7 @@ def read_quick_meta(path: Path) -> tuple[str, str, int, bool]:
 
 def compute_dest_dir(music_dir: Path, structure: str, artist: str, album: str) -> Path:
     """Return the destination directory for a track given its artist/album and library structure."""
-    s_artist = sanitize_name(artist.strip() or "Unknown Artist")
+    s_artist = sanitize_name(artist.strip() or "Unknown")
     if structure == "flat":
         return music_dir
     if structure == "artist":
@@ -277,7 +277,7 @@ def batch_organize(music_dir: Path, structure: str, skip_dirs: set, extensions: 
                    progress_cb=None, cancel_fn=None) -> tuple[int, int, list]:
     """Move every audio file into the folder dictated by its artist/album tags.
 
-    Does not edit tags. Files with no artist tag are skipped.
+    Does not edit tags. Files with no artist tag are moved to an Unknown folder.
     Returns (moved, skipped, errors).
     """
     files = collect_audio_files(music_dir, skip_dirs, extensions)
@@ -295,9 +295,6 @@ def batch_organize(music_dir: Path, structure: str, skip_dirs: set, extensions: 
                 continue
             artist = (mf.get("artist") or mf.get("albumartist") or [""])[0].strip()
             album = (mf.get("album") or [""])[0].strip()
-            if not artist:
-                skipped += 1
-                continue
             dest = compute_dest_dir(music_dir, structure, artist, album) / f.name
             if dest.resolve() == f.resolve():
                 skipped += 1
