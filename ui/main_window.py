@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QStatusBar, QLabel,
+    QDialog, QMainWindow, QTabWidget, QStatusBar, QLabel,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush
@@ -60,6 +60,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect_cross_tab()
 
+        if not self.config.get("setup_complete", False):
+            QTimer.singleShot(150, self._show_first_run)
+
     def _build_tabs(self):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -98,6 +101,33 @@ class MainWindow(QMainWindow):
     def _connect_cross_tab(self):
         self.settings_tab.settings_saved.connect(self._on_settings_saved)
         self.reencode_tab.reencode_completed.connect(self.library_tab.refresh)
+        self.download_tab.committed.connect(self.library_tab.refresh)
+        self._block_next_tab_change = False
+        self._revert_to_idx = 0
+        self.tabs.tabBar().tabBarClicked.connect(self._on_tab_bar_clicked)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_bar_clicked(self, clicked_idx: int):
+        current = self.tabs.currentIndex()
+        if current == clicked_idx:
+            return
+        playlist_idx = self.tabs.indexOf(self.playlist_tab)
+        settings_idx = self.tabs.indexOf(self.settings_tab)
+        if current == playlist_idx and self.playlist_tab._dirty:
+            if not self.playlist_tab.confirm_discard():
+                self._revert_to_idx = playlist_idx
+                self._block_next_tab_change = True
+        elif current == settings_idx and self.settings_tab._dirty:
+            if not self.settings_tab.confirm_discard():
+                self._revert_to_idx = settings_idx
+                self._block_next_tab_change = True
+
+    def _on_tab_changed(self, new_idx: int):
+        if self._block_next_tab_change:
+            self._block_next_tab_change = False
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(self._revert_to_idx)
+            self.tabs.blockSignals(False)
 
     def _on_settings_saved(self):
         self.config.load()
@@ -106,13 +136,22 @@ class MainWindow(QMainWindow):
         self.download_tab.refresh_from_config()
         self.sync_tab.refresh_from_config()
         self.duplicates_tab.refresh_from_config()
-        self.playlist_tab._scan_playlists()
+        self.playlist_tab.scan_playlists()
 
     def closeEvent(self, event):
-        if not self.playlist_tab._confirm_discard():
+        if not self.playlist_tab.confirm_discard():
+            event.ignore()
+            return
+        if not self.settings_tab.confirm_discard():
             event.ignore()
             return
         event.accept()
+
+    def _show_first_run(self):
+        from .first_run_wizard import FirstRunWizard
+        wizard = FirstRunWizard(self.config, self)
+        if wizard.exec() == QDialog.DialogCode.Accepted:
+            self._on_settings_saved()
 
     def set_status(self, msg: str, timeout_ms: int = 4000):
         self._status_msg.setText(msg)

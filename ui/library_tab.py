@@ -1,5 +1,6 @@
-import re
+import json
 import shutil
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -24,34 +25,50 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.config import Config
-from ..core.metadata import clean_file_tags, read_tags, write_tags
+from ..core.config import Config, LIBRARY_STRUCTURES
+from ..core.metadata import (
+    clean_file_tags, read_tags, write_tags,
+    read_quick_meta, compute_dest_dir, sanitize_name,
+)
 from ..workers.metadata_worker import NormalizeWorker
-from .styles import COLORS
+from .styles import COLORS, make_vdivider
 
-STRUCT_OPTIONS = ["artist/album", "artist", "flat"]
-
-_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
-def _sanitize(name: str) -> str:
-    return _INVALID_CHARS.sub("_", name).strip(".").strip() or "Unknown"
+_CACHE_PATH = Path.home() / ".cache" / "musicmanager" / "library_cache.json"
+_scan_cache: dict | None = None  # in-process shared cache across all LibraryTree instances
 
 
-def _quick_meta(path: Path) -> tuple[str, str, bool]:
-    """Returns (title, artist, has_missing). Fast mutagen read."""
+def _load_disk_cache() -> dict | None:
     try:
-        import mutagen
-
-        f = mutagen.File(path, easy=True)
-        if f is None:
-            return path.stem, "", True
-        title = (f.get("title") or [None])[0]
-        artist = (f.get("artist") or [None])[0]
-        missing = not title or not artist
-        return (title or path.stem), (artist or ""), missing
+        return json.loads(_CACHE_PATH.read_text())
     except Exception:
-        return path.stem, "", True
+        return None
+
+
+def _save_disk_cache(cache: dict):
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def _cache_is_fresh(cache: dict, config) -> bool:
+    """Return True if the cache matches the current config and the library hasn't changed on disk."""
+    if (cache.get("music_dir") != str(config.music_dir)
+            or cache.get("structure") != config.library_structure
+            or cache.get("show_titles") != config.show_titles):
+        return False
+    scan_time = cache.get("scan_time", 0)
+    try:
+        music_dir = config.music_dir
+        if music_dir.stat().st_mtime > scan_time:
+            return False
+        for d in music_dir.iterdir():
+            if d.is_dir() and d.stat().st_mtime > scan_time:
+                return False
+    except Exception:
+        return False
+    return True
 
 
 class _ScanThread(QThread):
@@ -64,6 +81,13 @@ class _ScanThread(QThread):
         self.extensions = extensions
         self.structure = structure
         self.show_titles = show_titles
+        self._cancelled = False
+
+    def _meta(self, path: Path) -> tuple[str, str, bool]:
+        if self.show_titles:
+            title, artist, _, missing = read_quick_meta(path)
+            return title, artist, missing
+        return path.stem, "", False
 
     def run(self):
         results = []
@@ -74,19 +98,20 @@ class _ScanThread(QThread):
         if self.structure == "flat":
             tracks = []
             for item in sorted(self.music_dir.rglob("*")):
+                if self._cancelled:
+                    return
                 if self.skip_dirs & set(item.relative_to(self.music_dir).parts):
                     continue
                 if item.is_file() and item.suffix.lower() in self.extensions:
-                    if self.show_titles:
-                        title, artist, missing = _quick_meta(item)
-                    else:
-                        title, artist, missing = item.stem, "", False
+                    title, artist, missing = self._meta(item)
                     tracks.append((title, str(item), missing))
             results.append(("All Tracks", [], tracks))
             self.done.emit(results)
             return
 
         for artist_dir in sorted(self.music_dir.iterdir()):
+            if self._cancelled:
+                return
             if not artist_dir.is_dir() or artist_dir.name in self.skip_dirs:
                 continue
             albums = []
@@ -94,30 +119,27 @@ class _ScanThread(QThread):
 
             if self.structure == "artist":
                 for child in sorted(artist_dir.rglob("*")):
+                    if self._cancelled:
+                        return
                     if child.is_file() and child.suffix.lower() in self.extensions:
-                        if self.show_titles:
-                            title, _, missing = _quick_meta(child)
-                        else:
-                            title, missing = child.stem, False
+                        title, _, missing = self._meta(child)
                         singles.append((title, str(child), missing))
             else:  # artist/album
                 for child in sorted(artist_dir.iterdir()):
+                    if self._cancelled:
+                        return
                     if child.is_dir():
                         songs = []
                         for f in sorted(child.iterdir()):
+                            if self._cancelled:
+                                return
                             if f.is_file() and f.suffix.lower() in self.extensions:
-                                if self.show_titles:
-                                    title, _, missing = _quick_meta(f)
-                                else:
-                                    title, missing = f.stem, False
+                                title, _, missing = self._meta(f)
                                 songs.append((title, str(f), missing))
                         if songs:
                             albums.append((child.name, songs))
                     elif child.is_file() and child.suffix.lower() in self.extensions:
-                        if self.show_titles:
-                            title, _, missing = _quick_meta(child)
-                        else:
-                            title, missing = child.stem, False
+                        title, _, missing = self._meta(child)
                         singles.append((title, str(child), missing))
 
             results.append((artist_dir.name, albums, singles))
@@ -129,6 +151,7 @@ class LibraryTree(QTreeWidget):
 
     file_activated = pyqtSignal(str)
     file_opened = pyqtSignal(str)
+    scan_complete = pyqtSignal()
 
     def __init__(self, config: Config, compact: bool = False, multi_select: bool = False, parent=None):
         super().__init__(parent)
@@ -144,11 +167,21 @@ class LibraryTree(QTreeWidget):
         self._thread: _ScanThread | None = None
 
     def refresh(self):
+        global _scan_cache
         if self._thread is not None:
+            self._thread._cancelled = True
             try:
                 self._thread.done.disconnect(self._populate)
             except (TypeError, RuntimeError):
                 pass
+            self._thread = None
+
+        if _scan_cache is None:
+            _scan_cache = _load_disk_cache()
+        if _scan_cache and _cache_is_fresh(_scan_cache, self.config):
+            self._populate(_scan_cache["results"])
+            return
+
         self.clear()
         thread = _ScanThread(
             self.config.music_dir,
@@ -162,6 +195,16 @@ class LibraryTree(QTreeWidget):
         self._thread = thread
 
     def _populate(self, results: list):
+        global _scan_cache
+        _scan_cache = {
+            "music_dir": str(self.config.music_dir),
+            "structure": self.config.library_structure,
+            "show_titles": self.config.show_titles,
+            "scan_time": time.time(),
+            "results": results,
+        }
+        _save_disk_cache(_scan_cache)
+
         self.clear()
         structure = self.config.library_structure
         warn_brush = QBrush(QColor(COLORS["warning"]))
@@ -174,6 +217,7 @@ class LibraryTree(QTreeWidget):
                     if missing:
                         item.setForeground(0, warn_brush)
                         item.setToolTip(0, "Missing title or artist metadata")
+            self.scan_complete.emit()
             return
 
         for artist_name, albums, singles in results:
@@ -200,6 +244,8 @@ class LibraryTree(QTreeWidget):
                 if missing:
                     si.setForeground(0, warn_brush)
                     si.setToolTip(0, "Missing title or artist metadata")
+
+        self.scan_complete.emit()
 
     def filter(self, text: str):
         text = text.lower()
@@ -263,10 +309,7 @@ class LibraryTab(QWidget):
 
         outer.addWidget(self._build_left_panel())
 
-        divider = QWidget()
-        divider.setFixedWidth(1)
-        divider.setStyleSheet("background:#30363d;")
-        outer.addWidget(divider)
+        outer.addWidget(make_vdivider())
 
         outer.addWidget(self._build_right_panel())
 
@@ -290,17 +333,18 @@ class LibraryTab(QWidget):
         struct_row = QHBoxLayout()
         struct_row.addWidget(QLabel("View:"))
         self._struct_combo = QComboBox()
-        for s in STRUCT_OPTIONS:
+        for s in LIBRARY_STRUCTURES:
             self._struct_combo.addItem(s.replace("/", " / "), s)
         saved = self.config.library_structure
-        if saved in STRUCT_OPTIONS:
-            self._struct_combo.setCurrentIndex(STRUCT_OPTIONS.index(saved))
+        if saved in LIBRARY_STRUCTURES:
+            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved))
         self._struct_combo.currentIndexChanged.connect(self._on_struct_change)
         struct_row.addWidget(self._struct_combo, 1)
         layout.addLayout(struct_row)
 
         self._tree = LibraryTree(self.config, compact=True)
         self._tree.file_activated.connect(self.load_file)
+        self._tree.scan_complete.connect(lambda: self._status_label.setText(str(self.config.music_dir)))
         layout.addWidget(self._tree)
 
         self._status_label = QLabel("")
@@ -327,7 +371,7 @@ class LibraryTab(QWidget):
 
         self._missing_banner = QLabel("⚠  Missing metadata — fill in the fields below.")
         self._missing_banner.setStyleSheet(
-            "color: #d29922; padding: 6px; border: 1px solid #d29922; border-radius: 4px;"
+            f"color: {COLORS['warning']}; padding: 6px; border: 1px solid {COLORS['warning']}; border-radius: 4px;"
         )
         self._missing_banner.setVisible(False)
         layout.addWidget(self._missing_banner)
@@ -439,16 +483,16 @@ class LibraryTab(QWidget):
     def refresh(self):
         self._status_label.setText("Scanning…")
         saved = self.config.library_structure
-        if saved in STRUCT_OPTIONS:
+        if saved in LIBRARY_STRUCTURES:
             self._struct_combo.blockSignals(True)
-            self._struct_combo.setCurrentIndex(STRUCT_OPTIONS.index(saved))
+            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved))
             self._struct_combo.blockSignals(False)
         self._tree.config = self.config
         self._tree.refresh()
-        self._tree._thread.done.connect(lambda _: self._status_label.setText(str(self.config.music_dir)))
 
     def _on_struct_change(self, _idx: int):
         self.config.set("library_structure", self._struct_combo.currentData())
+        self.config.save()
         self.refresh()
 
     def _filter_tree(self, text: str):
@@ -515,18 +559,12 @@ class LibraryTab(QWidget):
             path = path.parent
 
     def _dest_path(self, current: Path, tags: dict) -> Path:
-        music_dir = self.config.music_dir
-        structure = self.config.library_structure
-        filename = current.name
-        if structure == "flat":
-            return music_dir / filename
-        artist = _sanitize(tags.get("artist", "").strip() or "Unknown Artist")
-        if structure == "artist":
-            return music_dir / artist / filename
-        album = tags.get("album", "").strip()
-        if not album:
-            return music_dir / artist / filename
-        return music_dir / artist / _sanitize(album) / filename
+        return compute_dest_dir(
+            self.config.music_dir,
+            self.config.library_structure,
+            tags.get("artist", ""),
+            tags.get("album", ""),
+        ) / current.name
 
     def _save(self):
         if not self._current_file:
@@ -565,7 +603,7 @@ class LibraryTab(QWidget):
 
     def _show_saved(self, text="Saved"):
         self._save_status_label.setText(text)
-        self._save_status_label.setStyleSheet("color: #3fb950;")
+        self._save_status_label.setStyleSheet(f"color: {COLORS['success']};")
         self._save_status_label.setVisible(True)
         QTimer.singleShot(3000, lambda: self._save_status_label.setVisible(False))
 
@@ -582,6 +620,8 @@ class LibraryTab(QWidget):
     # ── Batch normalize ───────────────────────────────────────────────────────
 
     def _batch_normalize(self):
+        if self._worker and self._worker.isRunning():
+            return
         self._batch_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._batch_progress.setVisible(True)

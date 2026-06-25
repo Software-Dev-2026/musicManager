@@ -4,13 +4,13 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLineEdit, QDoubleSpinBox, QCheckBox, QComboBox,
     QPushButton, QLabel, QFileDialog, QMessageBox, QScrollArea,
-    QListWidget, QListWidgetItem, QInputDialog, QApplication, QStyle,
+    QListWidget, QListWidgetItem, QInputDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QAction
 
-from ..core.config import Config, encrypt_password
-from .library_tab import STRUCT_OPTIONS
+from ..core.config import Config, LIBRARY_STRUCTURES, encrypt_password
+from .styles import COLORS, OrderedListWidget
 
 
 class _PasswordEdit(QLineEdit):
@@ -35,8 +35,10 @@ class SettingsTab(QWidget):
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.config = config
+        self._dirty = False
         self._setup_ui()
         self._load_values()
+        self._connect_change_signals()
 
     def _setup_ui(self):
         # Outer layout: scroll area + sticky save bar
@@ -149,32 +151,9 @@ class SettingsTab(QWidget):
         prio_note.setObjectName("muted")
         prio_note.setWordWrap(True)
         dupe_form.addRow("Auto-Select Priority:", prio_note)
-        self._prio_dirs = QListWidget()
-        self._prio_dirs.setMaximumHeight(90)
-        prio_btns = QHBoxLayout()
-        add_prio = QPushButton("Add")
-        add_prio.clicked.connect(self._add_prio_dir)
-        rem_prio = QPushButton("Remove")
-        rem_prio.clicked.connect(self._remove_prio_dir)
-        _style = QApplication.style()
-        up_prio = QPushButton()
-        up_prio.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
-        up_prio.setFixedWidth(32)
-        up_prio.setToolTip("Move up (higher priority)")
-        up_prio.clicked.connect(self._move_prio_up)
-        dn_prio = QPushButton()
-        dn_prio.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
-        dn_prio.setFixedWidth(32)
-        dn_prio.setToolTip("Move down (lower priority)")
-        dn_prio.clicked.connect(self._move_prio_down)
-        prio_btns.addWidget(add_prio)
-        prio_btns.addWidget(rem_prio)
-        prio_btns.addSpacing(8)
-        prio_btns.addWidget(up_prio)
-        prio_btns.addWidget(dn_prio)
-        prio_btns.addStretch()
+        self._prio_dirs = OrderedListWidget("Directory name (top-level folder in music library):")
+        self._prio_dirs.setMaximumHeight(130)
         dupe_form.addRow("", self._prio_dirs)
-        dupe_form.addRow("", prio_btns)
 
         layout.addWidget(dupe_group)
 
@@ -204,7 +183,7 @@ class SettingsTab(QWidget):
 
         # ── Sticky save bar ───────────────────────────────────────────────────
         save_bar = QWidget()
-        save_bar.setStyleSheet("background:#161b22; border-top:1px solid #30363d;")
+        save_bar.setStyleSheet(f"background:{COLORS['bg_secondary']}; border-top:1px solid {COLORS['border']};")
         save_layout = QHBoxLayout(save_bar)
         save_layout.setContentsMargins(24, 10, 24, 10)
         save_btn = QPushButton("Save Settings")
@@ -213,14 +192,17 @@ class SettingsTab(QWidget):
         save_btn.clicked.connect(self._save)
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.clicked.connect(self._reset)
+        wizard_btn = QPushButton("Run Setup Wizard…")
+        wizard_btn.clicked.connect(self._run_wizard)
         save_layout.addWidget(save_btn)
         save_layout.addWidget(reset_btn)
         save_layout.addStretch()
+        save_layout.addWidget(wizard_btn)
         outer.addWidget(save_bar)
 
     def _make_struct_combo(self) -> QComboBox:
         self._struct_combo = QComboBox()
-        for s in STRUCT_OPTIONS:
+        for s in LIBRARY_STRUCTURES:
             self._struct_combo.addItem(s.replace("/", " / "), s)
         return self._struct_combo
 
@@ -230,8 +212,8 @@ class SettingsTab(QWidget):
         for d in self.config.skip_dirs:
             self._skip_dirs.addItem(QListWidgetItem(d))
         saved_struct = self.config.library_structure
-        if saved_struct in STRUCT_OPTIONS:
-            self._struct_combo.setCurrentIndex(STRUCT_OPTIONS.index(saved_struct))
+        if saved_struct in LIBRARY_STRUCTURES:
+            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved_struct))
         self._show_titles_cb.setChecked(self.config.show_titles)
         mode_idx = self._sync_mode_combo.findData(self.config.sync_mode)
         if mode_idx >= 0:
@@ -243,15 +225,11 @@ class SettingsTab(QWidget):
         self._folder_dest.setText(self.config.folder_sync_dest)
         self._fp_threshold.setValue(self.config.fingerprint_threshold)
         self._fp_cache.setText(str(self.config.fingerprint_cache))
-        self._dl_staging.setText(self.config.get(
-            "download.staging_dir",
-            str(Path.home() / ".cache" / "musicmanager" / "staging"),
-        ))
-        self._dl_embed_thumb.setChecked(bool(self.config.get("download.embed_thumbnail", True)))
-        self._dl_add_meta.setChecked(bool(self.config.get("download.add_metadata", True)))
-        self._prio_dirs.clear()
-        for d in self.config.dupes_priority_dirs:
-            self._prio_dirs.addItem(QListWidgetItem(d))
+        self._dl_staging.setText(self.config.get("download.staging_dir"))
+        self._dl_embed_thumb.setChecked(bool(self.config.get("download.embed_thumbnail")))
+        self._dl_add_meta.setChecked(bool(self.config.get("download.add_metadata")))
+        self._prio_dirs.set_items(self.config.dupes_priority_dirs)
+        self._dirty = False
 
     def _browse_music_dir(self):
         path = QFileDialog.getExistingDirectory(self, "Select Music Directory",
@@ -271,35 +249,54 @@ class SettingsTab(QWidget):
         if path:
             self._fp_cache.setText(path)
 
-    def _add_prio_dir(self):
-        text, ok = QInputDialog.getText(self, "Add Priority Directory",
-                                        "Directory name (top-level folder in music library):")
-        if ok and text.strip():
-            self._prio_dirs.addItem(QListWidgetItem(text.strip()))
-
-    def _remove_prio_dir(self):
-        for item in self._prio_dirs.selectedItems():
-            self._prio_dirs.takeItem(self._prio_dirs.row(item))
-
-    def _move_prio_up(self):
-        row = self._prio_dirs.currentRow()
-        if row > 0:
-            item = self._prio_dirs.takeItem(row)
-            self._prio_dirs.insertItem(row - 1, item)
-            self._prio_dirs.setCurrentRow(row - 1)
-
-    def _move_prio_down(self):
-        row = self._prio_dirs.currentRow()
-        if 0 <= row < self._prio_dirs.count() - 1:
-            item = self._prio_dirs.takeItem(row)
-            self._prio_dirs.insertItem(row + 1, item)
-            self._prio_dirs.setCurrentRow(row + 1)
-
     def _browse_dl_staging(self):
         path = QFileDialog.getExistingDirectory(self, "Select Staging Directory",
                                                  self._dl_staging.text())
         if path:
             self._dl_staging.setText(path)
+
+    def _mark_dirty(self, *_):
+        self._dirty = True
+
+    def _connect_change_signals(self):
+        self._music_dir.textChanged.connect(self._mark_dirty)
+        self._skip_dirs.model().rowsInserted.connect(self._mark_dirty)
+        self._skip_dirs.model().rowsRemoved.connect(self._mark_dirty)
+        self._struct_combo.currentIndexChanged.connect(self._mark_dirty)
+        self._show_titles_cb.toggled.connect(self._mark_dirty)
+        self._sync_mode_combo.currentIndexChanged.connect(self._mark_dirty)
+        self._smb_host.textChanged.connect(self._mark_dirty)
+        self._smb_share.textChanged.connect(self._mark_dirty)
+        self._smb_user.textChanged.connect(self._mark_dirty)
+        self._smb_pass.textChanged.connect(self._mark_dirty)
+        self._folder_dest.textChanged.connect(self._mark_dirty)
+        self._fp_threshold.valueChanged.connect(self._mark_dirty)
+        self._fp_cache.textChanged.connect(self._mark_dirty)
+        self._dl_staging.textChanged.connect(self._mark_dirty)
+        self._dl_embed_thumb.toggled.connect(self._mark_dirty)
+        self._dl_add_meta.toggled.connect(self._mark_dirty)
+        self._prio_dirs.changed.connect(self._mark_dirty)
+
+    def confirm_discard(self) -> bool:
+        """Show Save/Discard/Cancel dialog. Returns True if navigation may proceed."""
+        if not self._dirty:
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Unsaved Changes")
+        msg.setText("You have unsaved changes in Settings.")
+        save_btn = msg.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == save_btn:
+            self._save()
+            return True
+        if clicked == discard_btn:
+            self.config.load()
+            self._load_values()
+            return True
+        return False
 
     def _add_skip_dir(self):
         text, ok = QInputDialog.getText(self, "Add Skip Directory", "Directory name to skip:")
@@ -325,12 +322,13 @@ class SettingsTab(QWidget):
         self.config.set("fingerprint_threshold", self._fp_threshold.value())
         self.config.set("fingerprint_cache", self._fp_cache.text())
         self.config.set("dupes_priority_dirs",
-                        [self._prio_dirs.item(i).text() for i in range(self._prio_dirs.count())])
+                        self._prio_dirs.items())
         self.config.set("dupes_priority_configured", True)
         self.config.set("download.staging_dir", self._dl_staging.text())
         self.config.set("download.embed_thumbnail", self._dl_embed_thumb.isChecked())
         self.config.set("download.add_metadata", self._dl_add_meta.isChecked())
         self.config.save()
+        self._dirty = False
         QMessageBox.information(self, "Saved", "Settings saved.")
         self.settings_saved.emit()
 
@@ -340,6 +338,12 @@ class SettingsTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            from ..core.config import DEFAULTS, _deep_merge
-            self.config._data = _deep_merge({}, DEFAULTS)
+            self.config.reset()
             self._load_values()
+
+    def _run_wizard(self):
+        from .first_run_wizard import FirstRunWizard
+        wizard = FirstRunWizard(self.config, self.window())
+        if wizard.exec():
+            self._load_values()
+            self.settings_saved.emit()

@@ -397,6 +397,13 @@ QToolTip {
 }
 """
 
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtWidgets import (
+    QWidget, QFrame, QVBoxLayout, QHBoxLayout,
+    QListWidget, QListWidgetItem, QPushButton,
+    QInputDialog, QApplication, QStyle,
+)
+
 # Color constants for programmatic use
 COLORS = {
     "bg_primary": "#0d1117",
@@ -419,3 +426,94 @@ COLORS = {
     "deleted_text": "#f85149",
     "unchanged_text": "#484f58",
 }
+
+
+def make_vdivider() -> QWidget:
+    """1-px vertical divider widget matching the app border color."""
+    w = QWidget()
+    w.setFixedWidth(1)
+    w.setStyleSheet(f"background:{COLORS['border']};")
+    return w
+
+
+def make_hdivider() -> QFrame:
+    """Horizontal rule divider matching the app border color."""
+    line = QFrame()
+    line.setFrameShape(QFrame.Shape.HLine)
+    line.setStyleSheet(f"color: {COLORS['border']}; margin: 4px 0;")
+    return line
+
+
+class OrderedListWidget(QWidget):
+    """QListWidget with Add / Remove / Move-up / Move-down buttons."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, add_prompt: str = "Name:", parent=None):
+        super().__init__(parent)
+        self._add_prompt = add_prompt
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._list = QListWidget()
+        layout.addWidget(self._list)
+
+        btns = QHBoxLayout()
+        _sty = QApplication.style()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self._add)
+        rem_btn = QPushButton("Remove")
+        rem_btn.clicked.connect(self._remove)
+        up_btn = QPushButton()
+        up_btn.setIcon(_sty.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        up_btn.setFixedWidth(32)
+        up_btn.setToolTip("Move up (higher priority)")
+        up_btn.clicked.connect(self._move_up)
+        dn_btn = QPushButton()
+        dn_btn.setIcon(_sty.standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        dn_btn.setFixedWidth(32)
+        dn_btn.setToolTip("Move down (lower priority)")
+        dn_btn.clicked.connect(self._move_down)
+        btns.addWidget(add_btn)
+        btns.addWidget(rem_btn)
+        btns.addSpacing(8)
+        btns.addWidget(up_btn)
+        btns.addWidget(dn_btn)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+    def set_items(self, items: list):
+        self._list.clear()
+        for item in items:
+            self._list.addItem(QListWidgetItem(item))
+
+    def items(self) -> list:
+        return [self._list.item(i).text() for i in range(self._list.count())]
+
+    def _add(self):
+        text, ok = QInputDialog.getText(self, "Add", self._add_prompt)
+        if ok and text.strip():
+            self._list.addItem(QListWidgetItem(text.strip()))
+            self.changed.emit()
+
+    def _remove(self):
+        for item in self._list.selectedItems():
+            self._list.takeItem(self._list.row(item))
+        self.changed.emit()
+
+    def _move_up(self):
+        row = self._list.currentRow()
+        if row > 0:
+            item = self._list.takeItem(row)
+            self._list.insertItem(row - 1, item)
+            self._list.setCurrentRow(row - 1)
+            self.changed.emit()
+
+    def _move_down(self):
+        row = self._list.currentRow()
+        if 0 <= row < self._list.count() - 1:
+            item = self._list.takeItem(row)
+            self._list.insertItem(row + 1, item)
+            self._list.setCurrentRow(row + 1)
+            self.changed.emit()

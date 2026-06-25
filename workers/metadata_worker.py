@@ -12,14 +12,13 @@ class NormalizeWorker(BaseWorker):
 
     def run(self):
         def progress_cb(current, total, name):
-            if self._cancelled:
-                return
-            self._progress(current, total, name)
-            self._log(f"Processing: {name}")
+            self.progress.emit(current, total, name)
+            self.log.emit(f"Processing: {name}")
 
         try:
             changed, skipped = batch_normalize(
-                self.music_dir, self.skip_dirs, self.extensions, progress_cb
+                self.music_dir, self.skip_dirs, self.extensions,
+                progress_cb, cancel_fn=lambda: self._cancelled,
             )
             self.finished.emit({"changed": changed, "skipped": skipped})
         except Exception as e:

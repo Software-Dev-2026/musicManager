@@ -13,9 +13,3 @@ class BaseWorker(QThread):
 
     def cancel(self):
         self._cancelled = True
-
-    def _progress(self, current: int, total: int, msg: str = ""):
-        self.progress.emit(current, total, msg)
-
-    def _log(self, msg: str):
-        self.log.emit(msg)

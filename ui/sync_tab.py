@@ -17,7 +17,15 @@ _STATUS_COLORS = {
     FileStatus.NEW:       (COLORS["new"],     COLORS["new_text"],       "NEW"),
     FileStatus.CHANGED:   (COLORS["changed"], COLORS["changed_text"],   "CHANGED"),
     FileStatus.DELETED:   (COLORS["deleted"], COLORS["deleted_text"],   "DELETED"),
-    FileStatus.UNCHANGED: ("#0d1117",         COLORS["unchanged_text"], ""),
+    FileStatus.UNCHANGED: (COLORS["bg_primary"], COLORS["unchanged_text"], ""),
+}
+
+# Pull direction inverts NEW (local-only) and DELETED (remote-new)
+_STATUS_COLORS_PULL = {
+    FileStatus.NEW:       (COLORS["deleted"], COLORS["deleted_text"], "LOCAL ONLY"),
+    FileStatus.CHANGED:   (COLORS["changed"], COLORS["changed_text"], "CHANGED"),
+    FileStatus.DELETED:   (COLORS["new"],     COLORS["new_text"],     "REMOTE NEW"),
+    FileStatus.UNCHANGED: (COLORS["bg_primary"], COLORS["unchanged_text"], ""),
 }
 
 
@@ -193,16 +201,7 @@ class SyncTab(QWidget):
         self._diff_tree.clear()
         nodes: dict[str, QTreeWidgetItem] = {}
 
-        is_pull = self._pull_radio.isChecked()
-        if is_pull:
-            status_colors = {
-                FileStatus.NEW:       (COLORS["deleted"], COLORS["deleted_text"], "LOCAL ONLY"),
-                FileStatus.CHANGED:   (COLORS["changed"], COLORS["changed_text"], "CHANGED"),
-                FileStatus.DELETED:   (COLORS["new"],     COLORS["new_text"],     "REMOTE NEW"),
-                FileStatus.UNCHANGED: ("#0d1117",         COLORS["unchanged_text"], ""),
-            }
-        else:
-            status_colors = _STATUS_COLORS
+        status_colors = _STATUS_COLORS_PULL if self._pull_radio.isChecked() else _STATUS_COLORS
 
         def get_parent(rel: str):
             parts = rel.replace("\\", "/").split("/")
@@ -273,6 +272,8 @@ class SyncTab(QWidget):
         self._cancel_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._progress_msg.setVisible(False)
+        self._diff_tree.clear()
+        self._diff = None
         errors = stats.get("errors", [])
         self._summary_label.setText(
             f"Sync complete.  Transferred: {stats.get('transferred', 0)}  "

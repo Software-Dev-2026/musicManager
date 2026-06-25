@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QTextEdit, QFileDialog, QMessageBox,
     QTreeWidget, QTreeWidgetItem,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QColor
 
 from ..core.config import Config
@@ -123,7 +123,7 @@ class ReencodeTab(QWidget):
         self._fmt_combo = QComboBox()
         for fmt in AUDIO_CODECS:
             self._fmt_combo.addItem(fmt.upper(), fmt)
-        saved_fmt = self.config.get("reencode.target_format", "mp3")
+        saved_fmt = self.config.get("reencode.target_format")
         keys = list(AUDIO_CODECS.keys())
         if saved_fmt in keys:
             self._fmt_combo.setCurrentIndex(keys.index(saved_fmt))
@@ -139,8 +139,13 @@ class ReencodeTab(QWidget):
 
         settings_layout.addSpacing(16)
         self._delete_cb = QCheckBox("Delete originals after reencode")
-        self._delete_cb.setChecked(bool(self.config.get("reencode.delete_originals", False)))
+        self._delete_cb.setChecked(bool(self.config.get("reencode.delete_originals")))
         settings_layout.addWidget(self._delete_cb)
+
+        # Connect _save_settings only after all three widgets exist
+        self._fmt_combo.currentIndexChanged.connect(self._save_settings)
+        self._quality_combo.currentIndexChanged.connect(self._save_settings)
+        self._delete_cb.toggled.connect(self._save_settings)
 
         settings_layout.addSpacing(16)
         settings_layout.addWidget(QLabel("Output Dir:"))
@@ -206,6 +211,14 @@ class ReencodeTab(QWidget):
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         layout.addWidget(self._log)
+
+    def _save_settings(self, *_):
+        fmt = self._fmt_combo.currentData() or "mp3"
+        preset = self._quality_combo.currentText()
+        self.config.set("reencode.target_format", fmt)
+        self.config.set("reencode.quality_preset", preset)
+        self.config.set("reencode.delete_originals", self._delete_cb.isChecked())
+        self.config.save()
 
     def _update_quality_combo(self, _=None):
         fmt = self._fmt_combo.currentData() or "mp3"

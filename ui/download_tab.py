@@ -2,7 +2,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -10,7 +10,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -31,9 +30,9 @@ from PyQt6.QtWidgets import (
 
 from ..core.config import Config
 from ..core.downloader import AUDIO_FORMATS, check_ytdlp
-from ..core.metadata import read_tags, write_tags
+from ..core.metadata import read_tags, write_tags, compute_dest_dir
 from ..workers.download_worker import DownloadWorker
-from .styles import COLORS
+from .styles import COLORS, make_hdivider
 
 # Flat template: keeps all files in one directory, prefixes with uploader name
 _STAGING_TEMPLATE = "%(uploader)s - %(title)s.%(ext)s"
@@ -47,6 +46,8 @@ class _QueueItem:
 
 
 class DownloadTab(QWidget):
+    committed = pyqtSignal()
+
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.config = config
@@ -59,12 +60,10 @@ class DownloadTab(QWidget):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _staging_dir(self) -> Path:
-        p = Path(
-            self.config.get(
-                "download.staging_dir",
-                str(Path.home() / ".cache" / "musicmanager" / "staging"),
-            )
-        )
+        return Path(self.config.get("download.staging_dir"))
+
+    def _ensure_staging_dir(self) -> Path:
+        p = self._staging_dir()
         p.mkdir(parents=True, exist_ok=True)
         return p
 
@@ -115,17 +114,20 @@ class DownloadTab(QWidget):
         self._format_combo = QComboBox()
         for fmt in AUDIO_FORMATS:
             self._format_combo.addItem(fmt.upper(), fmt)
-        saved_fmt = self.config.get("download.format", "mp3")
+        saved_fmt = self.config.get("download.format")
         if saved_fmt in AUDIO_FORMATS:
             self._format_combo.setCurrentIndex(AUDIO_FORMATS.index(saved_fmt))
+        self._format_combo.currentIndexChanged.connect(self._save_options)
         fmt_row.addWidget(self._format_combo)
         fmt_row.addStretch()
         opts_layout.addLayout(fmt_row)
 
         self._thumb_cb = QCheckBox("Embed Thumbnail")
-        self._thumb_cb.setChecked(bool(self.config.get("download.embed_thumbnail", True)))
+        self._thumb_cb.setChecked(bool(self.config.get("download.embed_thumbnail")))
         self._meta_cb = QCheckBox("Fetch Metadata via yt-dlp")
-        self._meta_cb.setChecked(bool(self.config.get("download.add_metadata", True)))
+        self._meta_cb.setChecked(bool(self.config.get("download.add_metadata")))
+        self._thumb_cb.toggled.connect(self._save_options)
+        self._meta_cb.toggled.connect(self._save_options)
         opts_layout.addWidget(self._thumb_cb)
         opts_layout.addWidget(self._meta_cb)
 
@@ -220,7 +222,7 @@ class DownloadTab(QWidget):
         layout.addLayout(file_btns)
 
         # Divider
-        layout.addWidget(_divider())
+        layout.addWidget(make_hdivider())
 
         # Metadata editor
         self._meta_header = QLabel("Select files above to edit metadata")
@@ -245,6 +247,7 @@ class DownloadTab(QWidget):
             edit = QLineEdit()
             cb = QCheckBox("Apply")
             cb.setToolTip("Apply this field to all selected files when saving")
+            edit.textChanged.connect(lambda _, _cb=cb: _cb.setChecked(True))
             row.addWidget(edit)
             row.addWidget(cb)
             self._meta_fields[key] = (edit, cb)
@@ -256,6 +259,7 @@ class DownloadTab(QWidget):
             spin.setRange(0, 9999)
             spin.setFixedWidth(72)
             cb = QCheckBox("Apply")
+            spin.valueChanged.connect(lambda _, _cb=cb: _cb.setChecked(True))
             self._meta_fields[key] = (spin, cb)
             num_row.addWidget(QLabel(label + ":"))
             num_row.addWidget(spin)
@@ -272,7 +276,7 @@ class DownloadTab(QWidget):
         layout.addWidget(save_meta_btn)
 
         # Divider + commit
-        layout.addWidget(_divider())
+        layout.addWidget(make_hdivider())
 
         commit_hdr = QLabel("Commit to Library")
         commit_hdr.setObjectName("section_header")
@@ -318,8 +322,15 @@ class DownloadTab(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Select Staging Directory", str(self._staging_dir()))
         if path:
             self.config.set("download.staging_dir", path)
+            self.config.save()
             self._staging_path_label.setText(path)
             self._refresh_staging()
+
+    def _save_options(self, *_):
+        self.config.set("download.format", self._format_combo.currentData())
+        self.config.set("download.embed_thumbnail", self._thumb_cb.isChecked())
+        self.config.set("download.add_metadata", self._meta_cb.isChecked())
+        self.config.save()
 
     def refresh_from_config(self):
         self._staging_path_label.setText(str(self._staging_dir()))
@@ -357,7 +368,7 @@ class DownloadTab(QWidget):
 
         worker = DownloadWorker(
             item.url,
-            str(self._staging_dir()),
+            str(self._ensure_staging_dir()),
             self._format_combo.currentData(),
             self._thumb_cb.isChecked(),
             self._meta_cb.isChecked(),
@@ -454,13 +465,16 @@ class DownloadTab(QWidget):
 
     def _clear_meta_form(self):
         for _key, (widget, cb) in self._meta_fields.items():
+            widget.blockSignals(True)
             (widget.setText("") if isinstance(widget, QLineEdit) else widget.setValue(0))
+            widget.blockSignals(False)
             cb.setChecked(False)
 
     def _load_single_meta(self, filepath: str):
         tags = read_tags(filepath)
         for key, (widget, cb) in self._meta_fields.items():
             val = tags.get(key, "")
+            widget.blockSignals(True)
             if isinstance(widget, QLineEdit):
                 widget.setText(str(val))
             else:
@@ -468,13 +482,15 @@ class DownloadTab(QWidget):
                     widget.setValue(int(val) if str(val).strip() else 0)
                 except (ValueError, TypeError):
                     widget.setValue(0)
-            cb.setChecked(True)  # single file: apply all by default
+            widget.blockSignals(False)
+            cb.setChecked(False)
 
     def _load_bulk_meta(self, paths: list):
         all_tags = [read_tags(p) for p in paths]
         for key, (widget, cb) in self._meta_fields.items():
             vals = [str(t.get(key, "") or "") for t in all_tags]
             common = vals[0] if len(set(vals)) == 1 else ""
+            widget.blockSignals(True)
             if isinstance(widget, QLineEdit):
                 widget.setPlaceholderText("" if common else "(multiple values)")
                 widget.setText(common)
@@ -483,7 +499,8 @@ class DownloadTab(QWidget):
                     widget.setValue(int(common) if common.strip() else 0)
                 except (ValueError, TypeError):
                     widget.setValue(0)
-            cb.setChecked(False)  # bulk: user explicitly picks what to apply
+            widget.blockSignals(False)
+            cb.setChecked(False)
 
     def _save_metadata(self):
         sel = self._staging_tree.selectedItems()
@@ -552,20 +569,19 @@ class DownloadTab(QWidget):
             if not src.exists():
                 continue
             tags = read_tags(str(src))
-            artist = (tags.get("artist") or "Unknown Artist").strip()
-            album = (tags.get("album") or "").strip()
-
-            if structure == "flat":
-                dest_dir = music_dir
-            elif structure == "artist":
-                dest_dir = music_dir / artist
-            else:  # artist/album (default)
-                dest_dir = (music_dir / artist / album) if album else (music_dir / artist)
+            dest_dir = compute_dest_dir(
+                music_dir, structure,
+                tags.get("artist", ""),
+                tags.get("album", ""),
+            )
 
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / src.name
-            if dest.exists():  # avoid silent overwrite
-                dest = dest_dir / f"{src.stem}_1{src.suffix}"
+            if dest.exists():
+                n = 1
+                while (dest_dir / f"{src.stem}_{n}{src.suffix}").exists():
+                    n += 1
+                dest = dest_dir / f"{src.stem}_{n}{src.suffix}"
 
             try:
                 shutil.move(str(src), str(dest))
@@ -581,6 +597,8 @@ class DownloadTab(QWidget):
         else:
             QMessageBox.information(self, "Done", f"Committed {len(committed)} file(s) to the library.")
         self._refresh_staging()
+        if committed:
+            self.committed.emit()
 
     def _delete_from_staging(self):
         paths = self._selected_paths()
@@ -600,13 +618,3 @@ class DownloadTab(QWidget):
                 except Exception:
                     pass
             self._refresh_staging()
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def _divider() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("color: #30363d; margin: 4px 0;")
-    return line

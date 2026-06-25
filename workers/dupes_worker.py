@@ -27,28 +27,29 @@ class DupesWorker(BaseWorker):
         self._start_time = time.monotonic()
 
         def progress_cb(current: int, total: int, msg: str):
-            if self._cancelled:
-                return
             elapsed = time.monotonic() - self._start_time
             if current > 0 and total > 0:
                 rate = current / elapsed if elapsed > 0 else 0
                 remaining = (total - current) / rate if rate > 0 else 0
                 eta = f"ETA {_fmt_eta(remaining)}" if remaining > 0 else ""
                 pct = int(current / total * 100)
-                full_msg = f"[{pct}%] {msg}  {eta}"
+                full_msg = f"[{pct}%] {msg}" + (f"\n{eta}" if eta else "")
             else:
                 full_msg = msg
-            self._progress(current, total, full_msg)
-            self._log(msg)
+            self.progress.emit(current, total, full_msg)
+            self.log.emit(msg)
 
         try:
             groups = find_duplicates(
                 self.music_dir, self.skip_dirs, self.extensions,
                 self.cache_path, self.threshold, self.no_cache, progress_cb,
+                cancel_fn=lambda: self._cancelled,
             )
-            self.finished.emit(groups)
+            if not self._cancelled:
+                self.finished.emit(groups)
         except Exception as e:
-            self.error.emit(str(e))
+            if not self._cancelled:
+                self.error.emit(str(e))
 
 
 def _fmt_eta(seconds: float) -> str:

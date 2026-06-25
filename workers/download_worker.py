@@ -19,10 +19,10 @@ class DownloadWorker(BaseWorker):
 
     def run(self):
         def progress_cb(pct: float):
-            self._progress(int(pct), 100, f"{pct:.1f}%")
+            self.progress.emit(int(pct), 100, f"{pct:.1f}%")
 
         def log_cb(line: str):
-            self._log(line)
+            self.log.emit(line)
 
         try:
             rc = download(

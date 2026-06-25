@@ -1,25 +1,19 @@
-import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSlider,
-    QStyle,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -30,7 +24,7 @@ from PyQt6.QtWidgets import (
 from ..core.config import Config
 from ..core.duplicates import check_fpcalc, delete_files, rank_group, resolve_deletions
 from ..workers.dupes_worker import DupesWorker
-from .styles import COLORS
+from .styles import COLORS, OrderedListWidget
 
 
 class _PriorityDialog(QDialog):
@@ -50,65 +44,17 @@ class _PriorityDialog(QDialog):
         desc.setObjectName("muted")
         layout.addWidget(desc)
 
-        self._list = QListWidget()
-        for d in priority_dirs:
-            self._list.addItem(QListWidgetItem(d))
-        layout.addWidget(self._list)
-
-        btns = QHBoxLayout()
-        add_btn = QPushButton("Add")
-        add_btn.clicked.connect(self._add)
-        rem_btn = QPushButton("Remove")
-        rem_btn.clicked.connect(self._remove)
-        _style = QApplication.style()
-        up_btn = QPushButton()
-        up_btn.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
-        up_btn.setFixedWidth(32)
-        up_btn.setToolTip("Move up (higher priority)")
-        up_btn.clicked.connect(self._move_up)
-        dn_btn = QPushButton()
-        dn_btn.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
-        dn_btn.setFixedWidth(32)
-        dn_btn.setToolTip("Move down (lower priority)")
-        dn_btn.clicked.connect(self._move_down)
-        btns.addWidget(add_btn)
-        btns.addWidget(rem_btn)
-        btns.addSpacing(8)
-        btns.addWidget(up_btn)
-        btns.addWidget(dn_btn)
-        btns.addStretch()
-        layout.addLayout(btns)
+        self._ordered = OrderedListWidget("Directory name:")
+        self._ordered.set_items(priority_dirs)
+        layout.addWidget(self._ordered)
 
         bbox = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
         layout.addWidget(bbox)
 
-    def _add(self):
-        text, ok = QInputDialog.getText(self, "Add Directory", "Directory name:")
-        if ok and text.strip():
-            self._list.addItem(QListWidgetItem(text.strip()))
-
-    def _remove(self):
-        for item in self._list.selectedItems():
-            self._list.takeItem(self._list.row(item))
-
-    def _move_up(self):
-        row = self._list.currentRow()
-        if row > 0:
-            item = self._list.takeItem(row)
-            self._list.insertItem(row - 1, item)
-            self._list.setCurrentRow(row - 1)
-
-    def _move_down(self):
-        row = self._list.currentRow()
-        if 0 <= row < self._list.count() - 1:
-            item = self._list.takeItem(row)
-            self._list.insertItem(row + 1, item)
-            self._list.setCurrentRow(row + 1)
-
     def priority_dirs(self) -> list:
-        return [self._list.item(i).text() for i in range(self._list.count())]
+        return self._ordered.items()
 
 
 class DuplicatesTab(QWidget):
@@ -118,6 +64,7 @@ class DuplicatesTab(QWidget):
         self._worker: DupesWorker | None = None
         self._groups: list = []
         self._scan_start: float = 0.0
+        self._checked_count: int = 0
         self._setup_ui()
 
     def _setup_ui(self):
@@ -218,6 +165,7 @@ class DuplicatesTab(QWidget):
             )
             return
         self._results.clear()
+        self._checked_count = 0
         self._log.clear()
         self._groups.clear()
         self._scan_btn.setEnabled(False)
@@ -240,7 +188,6 @@ class DuplicatesTab(QWidget):
             threshold,
             self._no_cache_cb.isChecked(),
         )
-        self._scan_start = time.monotonic()
         self._worker.progress.connect(self._on_progress)
         self._worker.log.connect(lambda msg: self._log.append(msg))
         self._worker.finished.connect(self._on_done)
@@ -259,19 +206,8 @@ class DuplicatesTab(QWidget):
         if total > 0:
             self._progress_bar.setMaximum(total)
             self._progress_bar.setValue(current)
-        if current > 0 and total > 0:
-            elapsed = time.monotonic() - self._scan_start
-            remaining = int(elapsed / current * (total - current))
-            if remaining < 60:
-                eta_text = f"~{remaining}s remaining"
-            elif remaining < 3600:
-                m, s = divmod(remaining, 60)
-                eta_text = f"~{m}m {s}s remaining"
-            else:
-                h, r = divmod(remaining, 3600)
-                m, s = divmod(r, 60)
-                eta_text = f"~{h}h {m}m {s}s remaining"
-            self._eta_label.setText(eta_text)
+        if msg:
+            self._eta_label.setText(msg)
 
     def _on_done(self, groups: list):
         self._groups = groups
@@ -317,14 +253,23 @@ class DuplicatesTab(QWidget):
                 else:
                     child.setForeground(3, QColor(COLORS["warning"]))  # middle
 
-    def _on_item_changed(self, item: QTreeWidgetItem, _col: int = 0):
-        """Enable Delete button as soon as any checkbox is checked."""
-        any_checked = any(
+    def _on_item_changed(self, item: QTreeWidgetItem | None, _col: int = 0):
+        """Update running checked count and enable/disable Delete button."""
+        if item is not None and item.data(0, Qt.ItemDataRole.UserRole):
+            if item.checkState(0) == Qt.CheckState.Checked:
+                self._checked_count += 1
+            else:
+                self._checked_count = max(0, self._checked_count - 1)
+        self._delete_btn.setEnabled(self._checked_count > 0)
+
+    def _recalc_checked_count(self):
+        """Recount checked items after a bulk state change (used when signals are blocked)."""
+        self._checked_count = sum(
             self._results.topLevelItem(i).child(j).checkState(0) == Qt.CheckState.Checked
             for i in range(self._results.topLevelItemCount())
             for j in range(self._results.topLevelItem(i).childCount())
         )
-        self._delete_btn.setEnabled(any_checked)
+        self._delete_btn.setEnabled(self._checked_count > 0)
 
     def _refresh_auto_select_label(self):
         configured = self.config.get("dupes_priority_configured", False)
@@ -379,6 +324,7 @@ class DuplicatesTab(QWidget):
             self._rerank_all()
 
         priority_dirs = list(self.config.dupes_priority_dirs)
+        self._results.blockSignals(True)
         for i, group in enumerate(self._groups):
             to_delete, _ = resolve_deletions(group, self.config.music_dir, priority_dirs)
             group_item = self._results.topLevelItem(i)
@@ -389,12 +335,18 @@ class DuplicatesTab(QWidget):
                 path = Path(child.data(0, Qt.ItemDataRole.UserRole) or "")
                 checked = path in to_delete
                 child.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self._results.blockSignals(False)
+        self._recalc_checked_count()
 
     def _unselect_all(self):
+        self._results.blockSignals(True)
         for i in range(self._results.topLevelItemCount()):
             group = self._results.topLevelItem(i)
             for j in range(group.childCount()):
                 group.child(j).setCheckState(0, Qt.CheckState.Unchecked)
+        self._results.blockSignals(False)
+        self._checked_count = 0
+        self._delete_btn.setEnabled(False)
 
     def _collect_checked(self) -> list:
         paths = []
@@ -493,8 +445,7 @@ class DuplicatesTab(QWidget):
             self._auto_select_btn.setEnabled(False)
             self._unselect_btn.setEnabled(False)
 
-        # Let _on_item_changed recalculate delete button state
-        self._on_item_changed(None)
+        self._recalc_checked_count()
 
     def _on_error(self, msg: str):
         self._scan_btn.setEnabled(True)

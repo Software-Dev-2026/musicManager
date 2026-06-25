@@ -6,7 +6,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt, QCoreApplication
+from PyQt6.QtCore import QCoreApplication
 
 from musicmanager.ui.main_window import MainWindow
 from musicmanager.ui.styles import DARK_STYLESHEET

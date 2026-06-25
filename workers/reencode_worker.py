@@ -26,15 +26,15 @@ class ReencodeWorker(BaseWorker):
         for i, src in enumerate(self.files):
             if self._cancelled:
                 break
-            self._progress(i, total, str(src.name))
+            self.progress.emit(i, total, str(src.name))
             ok, detail = reencode_file(
                 src, self.output_dir, self.target_fmt,
                 self.quality_args, self.delete_originals,
             )
             if ok:
                 results["done"] += 1
-                self._log(f"[OK] {src.name} → {detail}")
+                self.log.emit(f"[OK] {src.name} → {detail}")
             else:
                 results["errors"].append(f"{src.name}: {detail}")
-                self._log(f"[ERR] {src.name}: {detail}")
+                self.log.emit(f"[ERR] {src.name}: {detail}")
         self.finished.emit(results)

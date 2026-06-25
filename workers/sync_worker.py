@@ -3,7 +3,6 @@ from .base_worker import BaseWorker
 from ..core.sync import (
     SyncDiff, SMBSyncer,
     compute_folder_diff, apply_folder_sync, apply_folder_pull,
-    FileStatus,
 )
 
 
@@ -17,7 +16,7 @@ class DiffWorker(BaseWorker):
 
     def run(self):
         def progress_cb(current, total, msg):
-            self._progress(current, total, msg)
+            self.progress.emit(current, total, msg)
 
         try:
             if self.mode == "folder":
@@ -35,11 +34,11 @@ class DiffWorker(BaseWorker):
                     self.config.smb_host, self.config.smb_share,
                     self.config.smb_user, self.config.smb_pass,
                 )
-                self._log(f"Connecting to {self.config.smb_host}…")
+                self.log.emit(f"Connecting to {self.config.smb_host}…")
                 if not syncer.connect():
                     self.error.emit(f"Cannot connect to {self.config.smb_host}")
                     return
-                self._log("Connected. Computing diff…")
+                self.log.emit("Connected. Computing diff…")
                 diff = syncer.compute_diff(
                     self.config.music_dir,
                     set(self.config.skip_dirs),
@@ -72,8 +71,8 @@ class SyncApplyWorker(BaseWorker):
 
     def run(self):
         def progress_cb(current, total, msg):
-            self._progress(current, total, msg)
-            self._log(f"[sync] {msg}")
+            self.progress.emit(current, total, msg)
+            self.log.emit(f"[sync] {msg}")
 
         try:
             local = self.config.music_dir

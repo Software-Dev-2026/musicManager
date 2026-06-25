@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -27,16 +27,16 @@ from PyQt6.QtWidgets import (
 
 from ..core.config import Config
 from ..core.downloader import decode_playlist
+from ..core.metadata import read_quick_meta
+from ..workers.base_worker import BaseWorker
 from .library_tab import LibraryTree
+from .styles import COLORS, make_vdivider
 
-_OK_COLOR = QColor("#3fb950")
-_MISS_COLOR = QColor("#f85149")
+_OK_COLOR = QColor(COLORS["success"])
+_MISS_COLOR = QColor(COLORS["error"])
 
 
-class _TrackInfoWorker(QThread):
-    progress = pyqtSignal(int, int)  # current, total
-    result = pyqtSignal(list)  # list[dict] of built entries
-
+class _TrackInfoWorker(BaseWorker):
     def __init__(self, paths: list[str], parent=None):
         super().__init__(parent)
         self._paths = paths
@@ -46,7 +46,7 @@ class _TrackInfoWorker(QThread):
         entries = []
         for i, p in enumerate(self._paths):
             path = Path(p)
-            title, dur = _read_track_info(path)
+            title, _, dur, _ = read_quick_meta(path)
             entries.append(
                 {
                     "raw": p,
@@ -56,8 +56,8 @@ class _TrackInfoWorker(QThread):
                     "exists": path.exists(),
                 }
             )
-            self.progress.emit(i + 1, total)
-        self.result.emit(entries)
+            self.progress.emit(i + 1, total, "")
+        self.finished.emit(entries)
 
 
 class _LibraryPickerDialog(QDialog):
@@ -110,20 +110,6 @@ class _LibraryPickerDialog(QDialog):
         return paths
 
 
-def _read_track_info(path: Path) -> tuple[str, int]:
-    """Return (title, duration_seconds) from audio tags. Falls back to stem / -1."""
-    try:
-        import mutagen
-
-        f = mutagen.File(path, easy=True)
-        if f is None:
-            return path.stem, -1
-        title = (f.get("title") or [None])[0] or path.stem
-        dur = int(f.info.length) if hasattr(f, "info") and hasattr(f.info, "length") else -1
-        return title, dur
-    except Exception:
-        return path.stem, -1
-
 
 def _parse_m3u(playlist_path: Path) -> list[dict]:
     try:
@@ -166,16 +152,20 @@ def _parse_m3u(playlist_path: Path) -> list[dict]:
     return entries
 
 
-def _write_m3u(playlist_path: Path, entries: list[dict]) -> None:
+def _write_m3u(playlist_path: Path, entries: list[dict]) -> list[str]:
+    """Write entries to an M3U file. Returns a list of paths that could not be made relative."""
     base = playlist_path.parent
     lines = ["#EXTM3U"]
+    unresolvable = []
     for e in entries:
         lines.append(f"#EXTINF:{e.get('duration', -1)},{e.get('title', '')}")
         try:
             lines.append(str(Path(e["path"]).relative_to(base)))
         except ValueError:
-            lines.append(Path(e["path"]).name)
+            unresolvable.append(e["path"])
+            lines.append(e["path"])
     playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return unresolvable
 
 
 def _fmt_duration(total_secs: int) -> str:
@@ -214,7 +204,7 @@ class PlaylistTab(QWidget):
         self._redo_stack: list[list[dict]] = []
         self._picker_dialog: _LibraryPickerDialog | None = None
         self._setup_ui()
-        self._scan_playlists()
+        self.scan_playlists()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -225,10 +215,7 @@ class PlaylistTab(QWidget):
 
         outer.addWidget(self._build_left())
 
-        div = QWidget()
-        div.setFixedWidth(1)
-        div.setStyleSheet("background:#30363d;")
-        outer.addWidget(div)
+        outer.addWidget(make_vdivider())
 
         outer.addWidget(self._build_right())
 
@@ -241,7 +228,7 @@ class PlaylistTab(QWidget):
 
     def _build_left(self) -> QWidget:
         left = QWidget()
-        left.setFixedWidth(240)
+        left.setFixedWidth(270)
         ll = QVBoxLayout(left)
         ll.setContentsMargins(8, 12, 4, 12)
         ll.setSpacing(8)
@@ -252,7 +239,7 @@ class PlaylistTab(QWidget):
         hdr.setObjectName("section_header")
         hdr_row.addWidget(hdr, 1)
         scan_btn = QPushButton("Scan")
-        scan_btn.clicked.connect(self._scan_playlists)
+        scan_btn.clicked.connect(self.scan_playlists)
         hdr_row.addWidget(scan_btn)
         ll.addLayout(hdr_row)
 
@@ -345,6 +332,9 @@ class PlaylistTab(QWidget):
         dn_btn.clicked.connect(self._move_down)
         rm_miss_btn = QPushButton("Remove Missing")
         rm_miss_btn.clicked.connect(self._remove_missing)
+        resolve_btn = QPushButton("Resolve Missing")
+        resolve_btn.setToolTip("Find missing tracks by filename in the music library")
+        resolve_btn.clicked.connect(self._resolve_missing)
         dedup_btn = QPushButton("Remove Duplicates")
         dedup_btn.clicked.connect(self._dedup)
         sort_lbl = QLabel("Sort:")
@@ -357,6 +347,7 @@ class PlaylistTab(QWidget):
         track_btns.addWidget(dn_btn)
         track_btns.addSpacing(12)
         track_btns.addWidget(rm_miss_btn)
+        track_btns.addWidget(resolve_btn)
         track_btns.addWidget(dedup_btn)
         track_btns.addSpacing(12)
         track_btns.addWidget(sort_lbl)
@@ -383,7 +374,7 @@ class PlaylistTab(QWidget):
 
     # ── Playlist sidebar ──────────────────────────────────────────────────────
 
-    def _scan_playlists(self):
+    def scan_playlists(self):
         self._playlist_list.clear()
         music_dir = self.config.music_dir
         if not music_dir.exists():
@@ -411,12 +402,14 @@ class PlaylistTab(QWidget):
         path = item.data(Qt.ItemDataRole.UserRole)
         if not path:
             return
-        if not self._confirm_discard():
+        if self._playlist_path == Path(path):
+            return
+        if not self.confirm_discard():
             return
         self._load_playlist(Path(path))
 
     def _new_playlist(self):
-        if not self._confirm_discard():
+        if not self.confirm_discard():
             return
         name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
         if not ok or not name.strip():
@@ -429,7 +422,7 @@ class PlaylistTab(QWidget):
             QMessageBox.warning(self, "Already Exists", f"{dest.name} already exists.")
             return
         dest.write_text("#EXTM3U\n", encoding="utf-8")
-        self._scan_playlists()
+        self.scan_playlists()
         self._select_in_list(dest)
         self._load_playlist(dest)
 
@@ -456,7 +449,7 @@ class PlaylistTab(QWidget):
         if self._playlist_path == path:
             self._playlist_path = new_path
             self._path_label.setText(str(new_path))
-        self._scan_playlists()
+        self.scan_playlists()
         self._select_in_list(new_path)
 
     def _delete_playlist(self):
@@ -477,7 +470,7 @@ class PlaylistTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             return
-        self._scan_playlists()
+        self.scan_playlists()
         if self._playlist_path == path:
             self._playlist_path = None
             self._entries = []
@@ -526,7 +519,7 @@ class PlaylistTab(QWidget):
         self._save_btn.setVisible(has_absolute)
         if has_absolute:
             self._save_status_label.setText("Unsaved changes")
-            self._save_status_label.setStyleSheet("color: #d29922;")
+            self._save_status_label.setStyleSheet(f"color: {COLORS['warning']};")
             self._save_status_label.setVisible(True)
         self._track_stack.setCurrentIndex(1)
         self._populate_track_list()
@@ -584,6 +577,7 @@ class PlaylistTab(QWidget):
         if self._picker_dialog is None:
             self._picker_dialog = _LibraryPickerDialog(self.config, self)
         self._picker_dialog._tree.clearSelection()
+        self._picker_dialog._tree.refresh()
         if self._picker_dialog.exec() != QDialog.DialogCode.Accepted:
             return
         paths = self._picker_dialog.selected_paths()
@@ -595,8 +589,8 @@ class PlaylistTab(QWidget):
         self._add_progress.setValue(0)
         self._add_progress.setVisible(True)
         self._add_worker = _TrackInfoWorker(paths, self)
-        self._add_worker.progress.connect(lambda cur, _tot: self._add_progress.setValue(cur))
-        self._add_worker.result.connect(self._on_add_done)
+        self._add_worker.progress.connect(lambda cur, _tot, _msg: self._add_progress.setValue(cur))
+        self._add_worker.finished.connect(self._on_add_done)
         self._add_worker.start()
 
     def _on_add_done(self, new_entries: list):
@@ -727,7 +721,16 @@ class PlaylistTab(QWidget):
         if not self._playlist_path:
             return
         try:
-            _write_m3u(self._playlist_path, self._entries)
+            unresolvable = _write_m3u(self._playlist_path, self._entries)
+            if unresolvable:
+                QMessageBox.warning(
+                    self,
+                    "Save Warning",
+                    f"{len(unresolvable)} track(s) could not be written as relative paths "
+                    f"(outside playlist directory) and were stored as absolute paths:\n"
+                    + "\n".join(unresolvable[:5])
+                    + (f"\n… and {len(unresolvable) - 5} more" if len(unresolvable) > 5 else ""),
+                )
             # Reload from the written file so raw/path/exists reflect the saved state.
             self._entries = _parse_m3u(self._playlist_path)
             music_dir = self.config.music_dir.resolve()
@@ -740,7 +743,7 @@ class PlaylistTab(QWidget):
             self._dirty = False
             self._save_btn.setVisible(False)
             self._save_status_label.setText("Saved")
-            self._save_status_label.setStyleSheet("color: #3fb950;")
+            self._save_status_label.setStyleSheet(f"color: {COLORS['success']};")
             self._save_status_label.setVisible(True)
             QTimer.singleShot(3000, lambda: self._save_status_label.setVisible(False))
             self._populate_track_list()
@@ -784,11 +787,45 @@ class PlaylistTab(QWidget):
     def _mark_dirty(self):
         self._dirty = True
         self._save_status_label.setText("Unsaved changes")
-        self._save_status_label.setStyleSheet("color: #d29922;")
+        self._save_status_label.setStyleSheet(f"color: {COLORS['warning']};")
         self._save_status_label.setVisible(True)
         self._save_btn.setVisible(True)
 
-    def _confirm_discard(self) -> bool:
+    def _resolve_missing(self):
+        missing = [(i, e) for i, e in enumerate(self._entries) if not e["exists"]]
+        if not missing:
+            QMessageBox.information(self, "None Missing", "All tracks are present on disk.")
+            return
+        music_dir = self.config.music_dir
+        if not music_dir.exists():
+            QMessageBox.warning(self, "No Music Directory", "Music directory not found.")
+            return
+        skip = set(self.config.skip_dirs)
+        audio_exts = self.config.audio_extensions
+        by_stem: dict[str, list] = {}
+        for f in music_dir.rglob("*"):
+            if f.suffix.lower() in audio_exts and not (skip & set(f.relative_to(music_dir).parts)):
+                by_stem.setdefault(f.stem.lower(), []).append(f)
+        resolvable = []
+        for i, entry in missing:
+            stem = Path(entry["path"]).stem.lower()
+            candidates = by_stem.get(stem, [])
+            if len(candidates) == 1:
+                resolvable.append((i, str(candidates[0])))
+        if not resolvable:
+            QMessageBox.information(self, "No Matches",
+                                    f"Could not auto-resolve any of {len(missing)} missing track(s).")
+            return
+        self._push_undo()
+        for i, new_path in resolvable:
+            self._entries[i]["path"] = new_path
+            self._entries[i]["exists"] = True
+        self._mark_dirty()
+        self._populate_track_list()
+        QMessageBox.information(self, "Resolved",
+                                f"Resolved {len(resolvable)} of {len(missing)} missing track(s).")
+
+    def confirm_discard(self) -> bool:
         if not self._dirty:
             return True
         msg = QMessageBox(self)
@@ -802,4 +839,14 @@ class PlaylistTab(QWidget):
         if clicked == save_btn:
             self._save()
             return True
-        return clicked == discard_btn
+        if clicked == discard_btn:
+            if self._playlist_path and self._playlist_path.exists():
+                self._entries = _parse_m3u(self._playlist_path)
+            self._dirty = False
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._save_btn.setVisible(False)
+            self._save_status_label.setVisible(False)
+            self._populate_track_list()
+            return True
+        return False
