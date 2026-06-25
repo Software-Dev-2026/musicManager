@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QSpinBox, QCheckBox, QLabel, QPushButton,
     QMessageBox, QProgressBar, QTextEdit, QSplitter, QSizePolicy,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from ..core.config import Config
 from ..core.metadata import read_tags, write_tags, clean_file_tags
@@ -146,6 +146,10 @@ class MetadataTab(QWidget):
         btn_row.addWidget(self._save_btn)
         btn_row.addWidget(self._clean_btn)
         btn_row.addWidget(self._reload_btn)
+        self._save_status_label = QLabel("")
+        self._save_status_label.setVisible(False)
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self._save_status_label)
         btn_row.addStretch()
         right_layout.addLayout(btn_row)
 
@@ -224,6 +228,12 @@ class MetadataTab(QWidget):
         self._clean_btn.setEnabled(True)
         self._reload_btn.setEnabled(True)
 
+    def _show_saved(self, text="Saved"):
+        self._save_status_label.setText(text)
+        self._save_status_label.setStyleSheet("color: #3fb950;")
+        self._save_status_label.setVisible(True)
+        QTimer.singleShot(3000, lambda: self._save_status_label.setVisible(False))
+
     def _collect_tags(self) -> dict:
         result = {}
         for key, widget in self._fields.items():
@@ -242,7 +252,7 @@ class MetadataTab(QWidget):
         ok = write_tags(self._current_file, tags)
         if ok:
             self._missing_banner.setVisible(False)
-            QMessageBox.information(self, "Saved", "Tags saved successfully.")
+            self._show_saved()
         else:
             QMessageBox.warning(self, "Error", "Failed to save tags.")
 

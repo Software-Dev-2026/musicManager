@@ -108,6 +108,12 @@ class MainWindow(QMainWindow):
         self.duplicates_tab.refresh_from_config()
         self.playlist_tab._scan_playlists()
 
+    def closeEvent(self, event):
+        if not self.playlist_tab._confirm_discard():
+            event.ignore()
+            return
+        event.accept()
+
     def set_status(self, msg: str, timeout_ms: int = 4000):
         self._status_msg.setText(msg)
         if timeout_ms > 0:

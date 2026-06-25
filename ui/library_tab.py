@@ -2,17 +2,30 @@ import re
 import shutil
 from pathlib import Path
 
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QTreeWidget, QTreeWidgetItem, QLineEdit, QLabel,
-    QPushButton, QFormLayout, QGroupBox, QComboBox,
-    QSpinBox, QCheckBox, QProgressBar, QTextEdit, QMessageBox,
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
+    QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
-from PyQt6.QtGui import QColor, QBrush
 
 from ..core.config import Config
-from ..core.metadata import read_tags, write_tags, clean_file_tags
+from ..core.metadata import clean_file_tags, read_tags, write_tags
 from ..workers.metadata_worker import NormalizeWorker
 from .styles import COLORS
 
@@ -29,6 +42,7 @@ def _quick_meta(path: Path) -> tuple[str, str, bool]:
     """Returns (title, artist, has_missing). Fast mutagen read."""
     try:
         import mutagen
+
         f = mutagen.File(path, easy=True)
         if f is None:
             return path.stem, "", True
@@ -43,8 +57,7 @@ def _quick_meta(path: Path) -> tuple[str, str, bool]:
 class _ScanThread(QThread):
     done = pyqtSignal(list)
 
-    def __init__(self, music_dir: Path, skip_dirs: set, extensions: set,
-                 structure: str, show_titles: bool):
+    def __init__(self, music_dir: Path, skip_dirs: set, extensions: set, structure: str, show_titles: bool):
         super().__init__()
         self.music_dir = music_dir
         self.skip_dirs = skip_dirs
@@ -113,15 +126,18 @@ class _ScanThread(QThread):
 
 class LibraryTree(QTreeWidget):
     """Reusable tree widget for browsing the music library."""
+
     file_activated = pyqtSignal(str)
     file_opened = pyqtSignal(str)
 
-    def __init__(self, config: Config, compact: bool = False, parent=None):
+    def __init__(self, config: Config, compact: bool = False, multi_select: bool = False, parent=None):
         super().__init__(parent)
         self.config = config
         self.compact = compact
         self.setHeaderHidden(True)
         self.setAlternatingRowColors(True)
+        if multi_select:
+            self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         if not compact:
             self.itemDoubleClicked.connect(self._on_double_click)
         self.itemSelectionChanged.connect(self._on_selection)
@@ -324,12 +340,12 @@ class LibraryTab(QWidget):
 
         self._fields: dict[str, QWidget] = {}
         for key, label in [
-            ("title",       "Title"),
-            ("artist",      "Artist"),
+            ("title", "Title"),
+            ("artist", "Artist"),
             ("albumartist", "Album Artist"),
-            ("album",       "Album"),
-            ("genre",       "Genre"),
-            ("comment",     "Comment"),
+            ("album", "Album"),
+            ("genre", "Genre"),
+            ("comment", "Comment"),
         ]:
             w = QLineEdit()
             w.setPlaceholderText(label)
@@ -382,15 +398,17 @@ class LibraryTab(QWidget):
         self._reload_btn.clicked.connect(lambda: self.load_file(self._current_file))
         for btn in (self._save_btn, self._clean_btn, self._reload_btn):
             btn_row.addWidget(btn)
+        self._save_status_label = QLabel("")
+        self._save_status_label.setVisible(False)
+        btn_row.addSpacing(12)
+        btn_row.addWidget(self._save_status_label)
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
         # Batch normalize
         batch_group = QGroupBox("Batch Normalize Library")
         batch_layout = QVBoxLayout(batch_group)
-        desc = QLabel(
-            "Sets artist / album artist / album for every file based on the folder structure."
-        )
+        desc = QLabel("Sets artist / album artist / album for every file based on the folder structure.")
         desc.setObjectName("muted")
         desc.setWordWrap(True)
         batch_layout.addWidget(desc)
@@ -427,9 +445,7 @@ class LibraryTab(QWidget):
             self._struct_combo.blockSignals(False)
         self._tree.config = self.config
         self._tree.refresh()
-        self._tree._thread.done.connect(
-            lambda _: self._status_label.setText(str(self.config.music_dir))
-        )
+        self._tree._thread.done.connect(lambda _: self._status_label.setText(str(self.config.music_dir)))
 
     def _on_struct_change(self, _idx: int):
         self.config.set("library_structure", self._struct_combo.currentData())
@@ -467,9 +483,7 @@ class LibraryTab(QWidget):
         size = tags.get("_size", 0)
         self._info_labels["size"].setText(f"{size / 1024 / 1024:.2f} MB")
         dur = tags.get("_duration", 0)
-        self._info_labels["duration"].setText(
-            f"{int(dur) // 60}:{int(dur) % 60:02d}" if dur else "—"
-        )
+        self._info_labels["duration"].setText(f"{int(dur) // 60}:{int(dur) % 60:02d}" if dur else "—")
         br = tags.get("_bitrate", 0)
         self._info_labels["bitrate"].setText(f"{br // 1000} kbps" if br else "—")
 
@@ -526,26 +540,34 @@ class LibraryTab(QWidget):
         current = Path(self._current_file)
         dest = self._dest_path(current, tags)
         if dest == current:
-            QMessageBox.information(self, "Saved", "Tags saved.")
+            self._show_saved()
             self.refresh()
             return
 
         if dest.exists():
-            QMessageBox.warning(self, "Saved (Not Moved)",
-                                f"Tags saved, but a file already exists at:\n{dest}")
+            QMessageBox.warning(self, "Saved (Not Moved)", f"Tags saved, but a file already exists at:\n{dest}")
             self.refresh()
             return
 
+        moved = False
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(current), str(dest))
             self._current_file = str(dest)
             self._file_label.setText(str(dest))
             self._prune_empty_dirs(current.parent)
+            moved = True
         except Exception as e:
-            QMessageBox.warning(self, "Saved (Move Failed)",
-                                f"Tags saved but could not move file:\n{e}")
+            QMessageBox.warning(self, "Saved (Move Failed)", f"Tags saved but could not move file:\n{e}")
+        if moved:
+            self._show_saved("Saved — file moved")
         self.refresh()
+
+    def _show_saved(self, text="Saved"):
+        self._save_status_label.setText(text)
+        self._save_status_label.setStyleSheet("color: #3fb950;")
+        self._save_status_label.setVisible(True)
+        QTimer.singleShot(3000, lambda: self._save_status_label.setVisible(False))
 
     def _clean(self):
         if not self._current_file:
@@ -566,7 +588,9 @@ class LibraryTab(QWidget):
         self._batch_progress.setValue(0)
         self._batch_log.clear()
         self._worker = NormalizeWorker(
-            self.config.music_dir, set(self.config.skip_dirs), self.config.audio_extensions,
+            self.config.music_dir,
+            set(self.config.skip_dirs),
+            self.config.audio_extensions,
         )
         self._worker.progress.connect(self._on_batch_progress)
         self._worker.log.connect(lambda msg: self._batch_log.append(msg))
@@ -583,9 +607,7 @@ class LibraryTab(QWidget):
         self._batch_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._batch_progress.setVisible(False)
-        self._batch_log.append(
-            f"\nDone. Changed: {result['changed']}  Skipped: {result['skipped']}"
-        )
+        self._batch_log.append(f"\nDone. Changed: {result['changed']}  Skipped: {result['skipped']}")
         self._tree.refresh()
         if self._current_file:
             self.load_file(self._current_file)
