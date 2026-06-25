@@ -472,16 +472,21 @@ class PlaylistTab(QWidget):
             return
         self.scan_playlists()
         if self._playlist_path == path:
-            self._playlist_path = None
-            self._entries = []
-            self._dirty = False
-            self._track_list.clear()
-            self._track_stack.setCurrentIndex(0)
-            self._path_label.setText("No playlist selected")
-            self._stats_label.setText("")
-            self._save_btn.setVisible(False)
-            self._save_status_label.setVisible(False)
-            self._fix_btn.setEnabled(False)
+            self._unload_playlist()
+
+    def _unload_playlist(self):
+        self._playlist_path = None
+        self._entries = []
+        self._dirty = False
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._track_list.clear()
+        self._track_stack.setCurrentIndex(0)
+        self._path_label.setText("No playlist selected")
+        self._stats_label.setText("")
+        self._save_btn.setVisible(False)
+        self._save_status_label.setVisible(False)
+        self._fix_btn.setEnabled(False)
 
     def _select_in_list(self, path: Path):
         for i in range(self._playlist_list.count()):
@@ -803,13 +808,20 @@ class PlaylistTab(QWidget):
         skip = set(self.config.skip_dirs)
         audio_exts = self.config.audio_extensions
         by_stem: dict[str, list] = {}
+        by_title: dict[str, list] = {}
         for f in music_dir.rglob("*"):
             if f.suffix.lower() in audio_exts and not (skip & set(f.relative_to(music_dir).parts)):
                 by_stem.setdefault(f.stem.lower(), []).append(f)
+                title, _, _, _ = read_quick_meta(f)
+                if title and title.lower() != f.stem.lower():
+                    by_title.setdefault(title.lower(), []).append(f)
         resolvable = []
         for i, entry in missing:
-            stem = Path(entry["path"]).stem.lower()
-            candidates = by_stem.get(stem, [])
+            key = Path(entry["path"]).stem.lower()
+            seen: dict = {}
+            for f in by_stem.get(key, []) + by_title.get(key, []):
+                seen[f] = None
+            candidates = list(seen)
             if len(candidates) == 1:
                 resolvable.append((i, str(candidates[0])))
         if not resolvable:
@@ -850,3 +862,8 @@ class PlaylistTab(QWidget):
             self._populate_track_list()
             return True
         return False
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._playlist_list.clearSelection()
+        self._unload_playlist()
