@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,41 @@ try:
     HAS_MUSIC_TAG = True
 except ImportError:
     HAS_MUSIC_TAG = False
+
+_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_name(name: str) -> str:
+    """Strip filesystem-illegal characters from a directory/file name component."""
+    return _INVALID_CHARS.sub("_", name).strip(".").strip() or "Unknown"
+
+
+def read_quick_meta(path: Path) -> tuple[str, str, int, bool]:
+    """Return (title, artist, duration_seconds, has_missing) via a fast mutagen read."""
+    try:
+        f = mutagen.File(path, easy=True)
+        if f is None:
+            return path.stem, "", -1, True
+        title = (f.get("title") or [None])[0]
+        artist = (f.get("artist") or [None])[0]
+        dur = int(f.info.length) if hasattr(f, "info") and hasattr(f.info, "length") else -1
+        missing = not title or not artist
+        return (title or path.stem), (artist or ""), dur, missing
+    except Exception:
+        return path.stem, "", -1, True
+
+
+def compute_dest_dir(music_dir: Path, structure: str, artist: str, album: str) -> Path:
+    """Return the destination directory for a track given its artist/album and library structure."""
+    s_artist = sanitize_name(artist.strip() or "Unknown Artist")
+    if structure == "flat":
+        return music_dir
+    if structure == "artist":
+        return music_dir / s_artist
+    if album.strip():
+        return music_dir / s_artist / sanitize_name(album.strip())
+    return music_dir / s_artist
+
 
 _TXXX_BLOCKLIST = {
     "ARTIST", "ARTISTS", "ARTIST NAME",
@@ -124,7 +160,7 @@ def read_tags(filepath: str) -> dict[str, Any]:
     return result
 
 
-def write_tags(filepath: str, tags: dict[str, Any]) -> bool:
+def write_tags(filepath: str, tags: dict[str, Any], clean: bool = False) -> bool:
     if not HAS_MUSIC_TAG:
         return False
     try:
@@ -152,7 +188,8 @@ def write_tags(filepath: str, tags: dict[str, Any]) -> bool:
             f.save()
         except Exception:
             return False
-    clean_file_tags(filepath)
+    if clean:
+        clean_file_tags(filepath)
     return True
 
 
@@ -203,26 +240,20 @@ def collect_audio_files(root: Path, skip_dirs: set, extensions: set) -> list[Pat
 
 
 def batch_normalize(music_dir: Path, skip_dirs: set, extensions: set,
-                    progress_cb=None) -> tuple[int, int]:
+                    progress_cb=None, cancel_fn=None) -> tuple[int, int]:
     changed = skipped = 0
-    artists = sorted([d for d in music_dir.iterdir() if d.is_dir()
-                      and d.name not in skip_dirs])
+    artists = sorted(d for d in music_dir.iterdir() if d.is_dir() and d.name not in skip_dirs)
     total = len(artists)
     for i, artist_dir in enumerate(artists):
+        if cancel_fn and cancel_fn():
+            break
         if progress_cb:
             progress_cb(i, total, artist_dir.name)
-        for album_dir in sorted([d for d in artist_dir.iterdir() if d.is_dir()]):
-            for song in sorted([f for f in album_dir.iterdir() if f.is_file()]):
-                if song.suffix.lower() not in extensions:
-                    continue
-                if normalize_file(str(song), artist_dir.name, album_dir.name):
-                    changed += 1
-                else:
-                    skipped += 1
-        for single in sorted([f for f in artist_dir.iterdir() if f.is_file()]):
-            if single.suffix.lower() not in extensions:
-                continue
-            if normalize_file(str(single), artist_dir.name, None):
+        for f in collect_audio_files(artist_dir, skip_dirs, extensions):
+            if cancel_fn and cancel_fn():
+                break
+            album: str | None = f.parent.name if f.parent != artist_dir else None
+            if normalize_file(str(f), artist_dir.name, album):
                 changed += 1
             else:
                 skipped += 1

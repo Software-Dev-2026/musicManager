@@ -10,18 +10,18 @@ _PW_KEY = b"MusicMgr2024XOR"
 
 DEFAULTS: dict = {
     "music_dir": str(Path.home() / "Music"),
-    "skip_dirs": ["editMetadata", "Metadata"],
+    "skip_dirs": [],
     "audio_extensions": [".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav"],
     "fingerprint_cache": str(Path.home() / ".cache" / "musicmanager" / "fingerprints.json"),
     "fingerprint_threshold": 0.9,
-    "dupes_priority_dirs": ["likes", "osu"],
+    "dupes_priority_dirs": [],
     "dupes_priority_configured": False,
     "library_structure": "artist/album",
     "show_titles": True,
-    "sync_mode": "server",
+    "sync_mode": "folder",
     "server": {
-        "host": "truenas-scale.taila98db7.ts.net",
-        "share": "test",
+        "host": "",
+        "share": "",
         "user": "",
         "pass": "",
     },
@@ -42,6 +42,7 @@ DEFAULTS: dict = {
         "output_dir": "",
     },
     "format_rank": {".flac": 4, ".wav": 3, ".m4a": 2, ".mp3": 2, ".ogg": 1, ".opus": 1},
+    "setup_complete": False,
 }
 
 
@@ -77,6 +78,11 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+LIBRARY_STRUCTURES = ["artist/album", "artist", "flat"]
+
+_MISSING = object()
+
+
 class Config:
     def __init__(self):
         self._data: dict = {}
@@ -95,14 +101,17 @@ class Config:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(json.dumps(self._data, indent=2))
 
+    def reset(self):
+        self._data = _deep_merge({}, DEFAULTS)
+
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
         val: Any = self._data
         for p in parts:
             if not isinstance(val, dict):
                 return default
-            val = val.get(p)
-            if val is None:
+            val = val.get(p, _MISSING)
+            if val is _MISSING:
                 return default
         return val
 
@@ -123,11 +132,11 @@ class Config:
 
     @property
     def skip_dirs(self) -> list:
-        return self.get("skip_dirs", [])
+        return self.get("skip_dirs")
 
     @property
     def audio_extensions(self) -> set:
-        return set(self.get("audio_extensions", []))
+        return set(self.get("audio_extensions"))
 
     @property
     def fingerprint_cache(self) -> Path:
@@ -135,39 +144,39 @@ class Config:
 
     @property
     def fingerprint_threshold(self) -> float:
-        return float(self.get("fingerprint_threshold", 0.9))
+        return float(self.get("fingerprint_threshold"))
 
     @property
     def dupes_priority_dirs(self) -> list:
-        return self.get("dupes_priority_dirs", ["likes", "osu"])
+        return self.get("dupes_priority_dirs")
 
     @property
     def library_structure(self) -> str:
-        return self.get("library_structure", "artist/album")
+        return self.get("library_structure")
 
     @property
     def show_titles(self) -> bool:
-        return bool(self.get("show_titles", True))
+        return bool(self.get("show_titles"))
 
     @property
     def sync_mode(self) -> str:
-        return self.get("sync_mode", "server")
+        return self.get("sync_mode")
 
     @property
     def smb_host(self) -> str:
-        return self.get("server.host", "")
+        return self.get("server.host")
 
     @property
     def smb_share(self) -> str:
-        return self.get("server.share", "")
+        return self.get("server.share")
 
     @property
     def smb_user(self) -> str:
-        return self.get("server.user", "")
+        return self.get("server.user")
 
     @property
     def smb_pass(self) -> str:
-        return decrypt_password(self.get("server.pass", ""))
+        return decrypt_password(self.get("server.pass"))
 
     def set_smb_pass(self, pw: str):
         self.set("server.pass", encrypt_password(pw))

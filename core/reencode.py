@@ -1,6 +1,5 @@
 import subprocess
 from pathlib import Path
-from typing import Callable
 
 AUDIO_CODECS = {
     "mp3":  "libmp3lame",

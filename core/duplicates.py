@@ -1,6 +1,5 @@
 import json
 import subprocess
-import sys
 from pathlib import Path
 from typing import Callable
 
@@ -74,12 +73,18 @@ def find_duplicates(
     threshold: float = 0.9,
     no_cache: bool = False,
     progress_cb: Callable | None = None,
+    cancel_fn: Callable | None = None,
 ) -> list[list[Path]]:
     files = collect_files(music_dir, skip_dirs, extensions)
     cache = {} if no_cache else load_cache(cache_path)
+    if progress_cb and cache:
+        progress_cb(0, len(files), f"Loaded {len(cache)} cached fingerprints")
     entries: list[tuple[Path, float, list]] = []
 
     for i, path in enumerate(files):
+        if cancel_fn and cancel_fn():
+            save_cache(cache_path, cache)
+            return []
         if progress_cb:
             progress_cb(i, len(files), f"Fingerprinting: {path.name[:50]}")
         key = str(path)
@@ -97,11 +102,16 @@ def find_duplicates(
 
     save_cache(cache_path, cache)
 
+    if cancel_fn and cancel_fn():
+        return []
+
     groups: list[list[Path]] = []
     used: set[int] = set()
     total = len(entries)
 
     for i, (path_a, dur_a, fp_a) in enumerate(entries):
+        if cancel_fn and cancel_fn():
+            return []
         if progress_cb:
             progress_cb(i, total, f"Comparing: {path_a.name[:50]}")
         if i in used:
