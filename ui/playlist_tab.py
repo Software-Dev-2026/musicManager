@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QStackedWidget,
     QStyle,
     QTreeWidget,
@@ -111,6 +112,156 @@ class _LibraryPickerDialog(QDialog):
 
 
 
+class _ManualResolveDialog(QDialog):
+    """Dialog for manually resolving playlist tracks that couldn't be auto-resolved."""
+
+    def __init__(self, unresolved: list, config: Config, parent=None):
+        super().__init__(parent)
+        # unresolved: [(original_entries_index, entry_dict), ...]
+        self._unresolved = list(unresolved)
+        self._changes: dict[int, str | None] = {}
+        self._selected_lib_path: str | None = None
+
+        self.setWindowTitle("Manual Resolve")
+        self.setMinimumSize(880, 540)
+        self.resize(1000, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── Left: missing tracks ─────────────────────────────────────────────
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 4, 0)
+        lbl = QLabel("Missing Tracks")
+        lbl.setObjectName("section_header")
+        ll.addWidget(lbl)
+        self._missing_list = QListWidget()
+        self._missing_list.itemSelectionChanged.connect(self._on_missing_selected)
+        for orig_idx, entry in self._unresolved:
+            item = QListWidgetItem(Path(entry["path"]).name)
+            item.setData(Qt.ItemDataRole.UserRole, orig_idx)
+            item.setToolTip(entry["path"])
+            self._missing_list.addItem(item)
+        ll.addWidget(self._missing_list, 1)
+        splitter.addWidget(left)
+
+        # ── Right: library tree ──────────────────────────────────────────────
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 0, 0)
+        lbl2 = QLabel("Library")
+        lbl2.setObjectName("section_header")
+        rl.addWidget(lbl2)
+        search = QLineEdit()
+        search.setPlaceholderText("Search…")
+        rl.addWidget(search)
+        self._tree = LibraryTree(config, compact=True)
+        self._tree.refresh()
+        self._tree.file_activated.connect(self._on_lib_selected)
+        self._tree.itemDoubleClicked.connect(self._on_lib_double_click)
+        search.textChanged.connect(self._tree.filter)
+        rl.addWidget(self._tree, 1)
+        splitter.addWidget(right)
+
+        splitter.setSizes([280, 620])
+        root.addWidget(splitter, 1)
+
+        # ── Action buttons ───────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        self._resolve_btn = QPushButton("Resolve to Selected")
+        self._resolve_btn.setObjectName("primary")
+        self._resolve_btn.setEnabled(False)
+        self._resolve_btn.clicked.connect(self._do_resolve)
+        self._delete_btn = QPushButton("Delete from Playlist")
+        self._delete_btn.setEnabled(False)
+        self._delete_btn.clicked.connect(self._do_delete)
+        self._skip_btn = QPushButton("Skip")
+        self._skip_btn.setEnabled(False)
+        self._skip_btn.clicked.connect(self._do_skip)
+        done_btn = QPushButton("Done")
+        done_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._resolve_btn)
+        btn_row.addWidget(self._delete_btn)
+        btn_row.addWidget(self._skip_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(done_btn)
+        root.addLayout(btn_row)
+
+        if self._missing_list.count():
+            self._missing_list.setCurrentRow(0)
+
+    def _on_missing_selected(self):
+        has = bool(self._missing_list.selectedItems())
+        self._delete_btn.setEnabled(has)
+        self._skip_btn.setEnabled(has)
+        self._resolve_btn.setEnabled(has and self._selected_lib_path is not None)
+
+    def _on_lib_selected(self, path: str):
+        self._selected_lib_path = path
+        self._resolve_btn.setEnabled(
+            bool(self._missing_list.selectedItems()) and bool(path)
+        )
+
+    def _on_lib_double_click(self, item, _col):
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path:
+            self._selected_lib_path = path
+            self._do_resolve()
+
+    def _current_item(self):
+        items = self._missing_list.selectedItems()
+        return items[0] if items else None
+
+    def _mark_item(self, item, status: str, detail: str = ""):
+        name = Path(item.toolTip()).name
+        if status == "resolved":
+            item.setForeground(_OK_COLOR)
+            item.setText(f"[resolved] {name}")
+        elif status == "deleted":
+            item.setForeground(_MISS_COLOR)
+            item.setText(f"[deleted] {name}")
+
+    def _advance(self):
+        current = self._missing_list.currentRow()
+        for i in range(current + 1, self._missing_list.count()):
+            if self._missing_list.item(i).data(Qt.ItemDataRole.UserRole) not in self._changes:
+                self._missing_list.setCurrentRow(i)
+                return
+        for i in range(0, current):
+            if self._missing_list.item(i).data(Qt.ItemDataRole.UserRole) not in self._changes:
+                self._missing_list.setCurrentRow(i)
+                return
+
+    def _do_resolve(self):
+        item = self._current_item()
+        if not item or not self._selected_lib_path:
+            return
+        orig_idx = item.data(Qt.ItemDataRole.UserRole)
+        self._changes[orig_idx] = self._selected_lib_path
+        self._mark_item(item, "resolved")
+        self._advance()
+
+    def _do_delete(self):
+        item = self._current_item()
+        if not item:
+            return
+        orig_idx = item.data(Qt.ItemDataRole.UserRole)
+        self._changes[orig_idx] = None
+        self._mark_item(item, "deleted")
+        self._advance()
+
+    def _do_skip(self):
+        self._advance()
+
+    def get_changes(self) -> dict:
+        """Returns {orig_idx: new_path} for resolved entries, {orig_idx: None} for deletions."""
+        return self._changes
+
+
 def _parse_m3u(playlist_path: Path) -> list[dict]:
     try:
         raw = playlist_path.read_text(encoding="utf-8", errors="replace")
@@ -163,7 +314,7 @@ def _write_m3u(playlist_path: Path, entries: list[dict]) -> list[str]:
             lines.append(str(Path(e["path"]).relative_to(base)))
         except ValueError:
             unresolvable.append(e["path"])
-            lines.append(e["path"])
+            lines.append(Path(e["path"]).name)
     playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return unresolvable
 
@@ -731,8 +882,8 @@ class PlaylistTab(QWidget):
                 QMessageBox.warning(
                     self,
                     "Save Warning",
-                    f"{len(unresolvable)} track(s) could not be written as relative paths "
-                    f"(outside playlist directory) and were stored as absolute paths:\n"
+                    f"{len(unresolvable)} track(s) were outside the playlist directory and "
+                    f"have been saved as filename only:\n"
                     + "\n".join(unresolvable[:5])
                     + (f"\n… and {len(unresolvable) - 5} more" if len(unresolvable) > 5 else ""),
                 )
@@ -808,34 +959,68 @@ class PlaylistTab(QWidget):
         skip = set(self.config.skip_dirs)
         audio_exts = self.config.audio_extensions
         by_stem: dict[str, list] = {}
-        by_title: dict[str, list] = {}
         for f in music_dir.rglob("*"):
             if f.suffix.lower() in audio_exts and not (skip & set(f.relative_to(music_dir).parts)):
                 by_stem.setdefault(f.stem.lower(), []).append(f)
-                title, _, _, _ = read_quick_meta(f)
-                if title and title.lower() != f.stem.lower():
-                    by_title.setdefault(title.lower(), []).append(f)
         resolvable = []
         for i, entry in missing:
-            key = Path(entry["path"]).stem.lower()
-            seen: dict = {}
-            for f in by_stem.get(key, []) + by_title.get(key, []):
-                seen[f] = None
-            candidates = list(seen)
+            stem = Path(entry["path"]).stem.lower()
+            candidates = by_stem.get(stem, [])
             if len(candidates) == 1:
                 resolvable.append((i, str(candidates[0])))
+
         if not resolvable:
-            QMessageBox.information(self, "No Matches",
-                                    f"Could not auto-resolve any of {len(missing)} missing track(s).")
+            msg = QMessageBox(self)
+            msg.setWindowTitle("No Matches")
+            msg.setText(f"Could not auto-resolve any of {len(missing)} missing track(s).")
+            manual_btn = msg.addButton("Manual Resolve…", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == manual_btn:
+                self._open_manual_resolve(missing)
             return
+
         self._push_undo()
         for i, new_path in resolvable:
             self._entries[i]["path"] = new_path
             self._entries[i]["exists"] = True
         self._mark_dirty()
         self._populate_track_list()
-        QMessageBox.information(self, "Resolved",
-                                f"Resolved {len(resolvable)} of {len(missing)} missing track(s).")
+
+        resolved_idxs = {i for i, _ in resolvable}
+        still_unresolved = [(i, e) for i, e in missing if i not in resolved_idxs]
+        if still_unresolved:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Resolved")
+            msg.setText(
+                f"Resolved {len(resolvable)} of {len(missing)} missing track(s).\n"
+                f"{len(still_unresolved)} could not be auto-resolved."
+            )
+            manual_btn = msg.addButton("Manual Resolve…", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            if msg.clickedButton() == manual_btn:
+                self._open_manual_resolve(still_unresolved)
+        else:
+            QMessageBox.information(self, "Resolved",
+                                    f"Resolved all {len(resolvable)} missing track(s).")
+
+    def _open_manual_resolve(self, unresolved: list):
+        dlg = _ManualResolveDialog(unresolved, self.config, self)
+        dlg.exec()
+        changes = dlg.get_changes()
+        if not changes:
+            return
+        self._push_undo()
+        for orig_idx, new_path in changes.items():
+            if new_path is None:
+                self._entries[orig_idx] = None
+            else:
+                self._entries[orig_idx]["path"] = new_path
+                self._entries[orig_idx]["exists"] = True
+        self._entries = [e for e in self._entries if e is not None]
+        self._mark_dirty()
+        self._populate_track_list()
 
     def confirm_discard(self) -> bool:
         if not self._dirty:
