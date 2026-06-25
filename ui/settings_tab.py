@@ -110,7 +110,7 @@ class SettingsTab(QWidget):
         self._smb_pass = _PasswordEdit()
         smb_form.addRow("Password:", self._smb_pass)
 
-        note = QLabel("Password is stored obfuscated (XOR+Base64) in ~/.config/musicmanager/config.json")
+        note = QLabel("Password is stored obfuscated (XOR+Base64) in the config file.")
         note.setObjectName("muted")
         smb_form.addRow("", note)
         layout.addWidget(smb_group)

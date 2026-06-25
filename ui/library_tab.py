@@ -33,7 +33,8 @@ from ..core.metadata import (
 from ..workers.metadata_worker import NormalizeWorker
 from .styles import COLORS, make_vdivider
 
-_CACHE_PATH = Path.home() / ".cache" / "musicmanager" / "library_cache.json"
+from ..core.config import _CACHE_DIR
+_CACHE_PATH = _CACHE_DIR / "library_cache.json"
 _scan_cache: dict | None = None  # in-process shared cache across all LibraryTree instances
 
 

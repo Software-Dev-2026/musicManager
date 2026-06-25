@@ -1,9 +1,20 @@
 import base64
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
-CONFIG_DIR = Path.home() / ".config" / "musicmanager"
+if sys.platform == "win32":
+    CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "musicmanager"
+    _CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "musicmanager"
+elif sys.platform == "darwin":
+    CONFIG_DIR = Path.home() / "Library" / "Application Support" / "musicmanager"
+    _CACHE_DIR = Path.home() / "Library" / "Caches" / "musicmanager"
+else:
+    CONFIG_DIR = Path.home() / ".config" / "musicmanager"
+    _CACHE_DIR = Path.home() / ".cache" / "musicmanager"
+
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 _PW_KEY = b"MusicMgr2024XOR"
@@ -12,7 +23,7 @@ DEFAULTS: dict = {
     "music_dir": str(Path.home() / "Music"),
     "skip_dirs": [],
     "audio_extensions": [".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav"],
-    "fingerprint_cache": str(Path.home() / ".cache" / "musicmanager" / "fingerprints.json"),
+    "fingerprint_cache": str(_CACHE_DIR / "fingerprints.json"),
     "fingerprint_threshold": 0.9,
     "dupes_priority_dirs": [],
     "dupes_priority_configured": False,
@@ -30,7 +41,7 @@ DEFAULTS: dict = {
     },
     "sync_delete": False,
     "download": {
-        "staging_dir": str(Path.home() / ".cache" / "musicmanager" / "staging"),
+        "staging_dir": str(_CACHE_DIR / "staging"),
         "format": "mp3",
         "embed_thumbnail": True,
         "add_metadata": True,

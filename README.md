@@ -107,18 +107,31 @@ On first launch, a setup wizard walks through the minimum configuration: music d
 
 ## Configuration
 
-Settings are stored at:
-
+**Linux:**
 ```
 ~/.config/musicmanager/config.json
-```
 
-Cache files:
-
-```
 ~/.cache/musicmanager/fingerprints.json   # acoustic fingerprint cache
 ~/.cache/musicmanager/staging/            # download staging directory (default)
 ~/.cache/musicmanager/library_cache.json  # library scan cache
+```
+
+**macOS:**
+```
+~/Library/Application Support/musicmanager/config.json
+
+~/Library/Caches/musicmanager/fingerprints.json
+~/Library/Caches/musicmanager/staging/
+~/Library/Caches/musicmanager/library_cache.json
+```
+
+**Windows:**
+```
+%APPDATA%\musicmanager\config.json
+
+%LOCALAPPDATA%\musicmanager\fingerprints.json
+%LOCALAPPDATA%\musicmanager\staging\
+%LOCALAPPDATA%\musicmanager\library_cache.json
 ```
 
 The SMB password is stored obfuscated (XOR + Base64) in the config file. It is not encrypted.
