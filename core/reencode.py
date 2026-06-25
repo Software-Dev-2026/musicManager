@@ -10,6 +10,15 @@ AUDIO_CODECS = {
     "wav":  "pcm_s16le",
 }
 
+# Broad set of audio extensions used when scanning for reencode sources.
+# Wider than the library playback config so formats like .wma/.aiff/.ape
+# are included when normalising a library.
+REENCODE_SOURCE_EXTENSIONS = {
+    ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav",
+    ".aiff", ".aif", ".wma", ".ape", ".mp2", ".mp4",
+    ".mpc", ".wv", ".tta", ".ac3",
+}
+
 QUALITY_PRESETS: dict[str, list] = {
     "mp3": [
         ("VBR V0 (best)", ["-q:a", "0"]),

@@ -12,7 +12,7 @@ from PyQt6.QtGui import QColor
 from ..core.config import Config
 from ..core.reencode import (
     detect_formats, collect_reencoding_targets,
-    QUALITY_PRESETS, AUDIO_CODECS, check_ffmpeg,
+    QUALITY_PRESETS, AUDIO_CODECS, REENCODE_SOURCE_EXTENSIONS, check_ffmpeg,
 )
 from ..workers.reencode_worker import ReencodeWorker
 from .styles import COLORS
@@ -253,7 +253,7 @@ class ReencodeTab(QWidget):
     def _analyze(self):
         self._analysis_tree.clear()
         counts = detect_formats(
-            self.config.music_dir, set(self.config.skip_dirs), self.config.audio_extensions
+            self.config.music_dir, set(self.config.skip_dirs), REENCODE_SOURCE_EXTENSIONS
         )
         total = sum(counts.values()) or 1
         sorted_counts = sorted(counts.items(), key=lambda x: x[1], reverse=True)
@@ -284,7 +284,7 @@ class ReencodeTab(QWidget):
 
         self._targets = collect_reencoding_targets(
             self.config.music_dir, set(self.config.skip_dirs),
-            self.config.audio_extensions, fmt,
+            REENCODE_SOURCE_EXTENSIONS, fmt,
         )
         warn_count = 0
         for f in self._targets:
