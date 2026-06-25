@@ -420,7 +420,7 @@ class DownloadTab(QWidget):
     def _refresh_staging(self):
         self._staging_tree.clear()
         self._staging_files.clear()
-        staging = self._staging_dir()
+        staging = self._ensure_staging_dir()
         for f in sorted(staging.iterdir()):
             if not (f.is_file() and f.suffix.lower() in self.config.audio_extensions):
                 continue

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 import sys
-import os
+import importlib
+from pathlib import Path
 
-# Ensure the parent directory is in the path so `musicmanager` is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_here = Path(__file__).resolve().parent
+_pkg = _here.name  # derived at runtime so renaming the folder still works
+sys.path.insert(0, str(_here.parent))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QCoreApplication
 
-from musicmanager.ui.main_window import MainWindow
-from musicmanager.ui.styles import DARK_STYLESHEET
+MainWindow = importlib.import_module(f"{_pkg}.ui.main_window").MainWindow
+DARK_STYLESHEET = importlib.import_module(f"{_pkg}.ui.styles").DARK_STYLESHEET
 
 
 def main():

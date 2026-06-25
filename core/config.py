@@ -96,6 +96,8 @@ _MISSING = object()
 
 class Config:
     def __init__(self):
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._data: dict = {}
         self.load()
 
