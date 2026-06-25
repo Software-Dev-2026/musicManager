@@ -4,9 +4,9 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QComboBox, QCheckBox, QLabel, QPushButton,
     QProgressBar, QTextEdit, QFileDialog, QMessageBox,
-    QTreeWidget, QTreeWidgetItem,
+    QSplitter, QTreeWidget, QTreeWidgetItem,
 )
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 
 from ..core.config import Config
@@ -85,9 +85,20 @@ class ReencodeTab(QWidget):
         self._setup_ui()
 
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_settings_panel())
+        splitter.addWidget(self._build_files_panel())
+        splitter.setSizes([360, 700])
+        outer.addWidget(splitter)
+
+    def _build_settings_panel(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(12, 12, 6, 12)
+        layout.setSpacing(10)
 
         if not check_ffmpeg():
             warn = QLabel("ffmpeg is not installed. Install with: sudo dnf install ffmpeg")
@@ -97,13 +108,10 @@ class ReencodeTab(QWidget):
         # Library analysis
         analysis_group = QGroupBox("Library Format Analysis")
         analysis_layout = QVBoxLayout(analysis_group)
-        analysis_btns = QHBoxLayout()
         self._analyze_btn = QPushButton("Analyze Library")
         self._analyze_btn.setObjectName("primary")
         self._analyze_btn.clicked.connect(self._analyze)
-        analysis_btns.addWidget(self._analyze_btn)
-        analysis_btns.addStretch()
-        analysis_layout.addLayout(analysis_btns)
+        analysis_layout.addWidget(self._analyze_btn)
         self._analysis_tree = QTreeWidget()
         self._analysis_tree.setHeaderLabels(["Format", "Count", "Percentage"])
         self._analysis_tree.setMaximumHeight(160)
@@ -118,8 +126,10 @@ class ReencodeTab(QWidget):
 
         # Reencode settings
         settings_group = QGroupBox("Reencode Settings")
-        settings_layout = QHBoxLayout(settings_group)
-        settings_layout.addWidget(QLabel("Target Format:"))
+        settings_layout = QVBoxLayout(settings_group)
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Target Format:"))
         self._fmt_combo = QComboBox()
         for fmt in AUDIO_CODECS:
             self._fmt_combo.addItem(fmt.upper(), fmt)
@@ -128,51 +138,63 @@ class ReencodeTab(QWidget):
         if saved_fmt in keys:
             self._fmt_combo.setCurrentIndex(keys.index(saved_fmt))
         self._fmt_combo.currentIndexChanged.connect(self._update_quality_combo)
-        settings_layout.addWidget(self._fmt_combo)
+        fmt_row.addWidget(self._fmt_combo)
+        fmt_row.addStretch()
+        settings_layout.addLayout(fmt_row)
 
-        settings_layout.addSpacing(16)
-        settings_layout.addWidget(QLabel("Quality:"))
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("Quality:"))
         self._quality_combo = QComboBox()
         self._quality_combo.setMinimumWidth(180)
-        settings_layout.addWidget(self._quality_combo)
+        quality_row.addWidget(self._quality_combo)
+        quality_row.addStretch()
+        settings_layout.addLayout(quality_row)
         self._update_quality_combo()
 
-        settings_layout.addSpacing(16)
         self._delete_cb = QCheckBox("Delete originals after reencode")
         self._delete_cb.setChecked(bool(self.config.get("reencode.delete_originals")))
         settings_layout.addWidget(self._delete_cb)
 
-        # Connect _save_settings only after all three widgets exist
-        self._fmt_combo.currentIndexChanged.connect(self._save_settings)
-        self._quality_combo.currentIndexChanged.connect(self._save_settings)
-        self._delete_cb.toggled.connect(self._save_settings)
-
-        settings_layout.addSpacing(16)
-        settings_layout.addWidget(QLabel("Output Dir:"))
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Output Dir:"))
         self._output_label = QLabel("Same folder as source")
         self._output_label.setObjectName("muted")
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_output)
         clear_btn = QPushButton("Same Folder")
         clear_btn.clicked.connect(lambda: self._output_label.setText("Same folder as source"))
-        settings_layout.addWidget(self._output_label)
-        settings_layout.addWidget(browse_btn)
-        settings_layout.addWidget(clear_btn)
-        settings_layout.addStretch()
-        layout.addWidget(settings_group)
+        output_row.addWidget(self._output_label, 1)
+        output_row.addWidget(browse_btn)
+        output_row.addWidget(clear_btn)
+        settings_layout.addLayout(output_row)
 
-        # Target files list
-        targets_group = QGroupBox("Files to Reencode")
-        targets_layout = QVBoxLayout(targets_group)
-        find_btns = QHBoxLayout()
+        # Connect _save_settings only after all three widgets exist
+        self._fmt_combo.currentIndexChanged.connect(self._save_settings)
+        self._quality_combo.currentIndexChanged.connect(self._save_settings)
+        self._delete_cb.toggled.connect(self._save_settings)
+
+        layout.addWidget(settings_group)
+        layout.addStretch()
+        return w
+
+    def _build_files_panel(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 12, 12, 12)
+        layout.setSpacing(10)
+
+        hdr = QLabel("Files to Reencode")
+        hdr.setObjectName("section_header")
+        layout.addWidget(hdr)
+
+        find_row = QHBoxLayout()
         self._find_btn = QPushButton("Find Files")
         self._find_btn.clicked.connect(self._find_targets)
         self._targets_label = QLabel("Click 'Find Files' to see what would be reencoded")
         self._targets_label.setObjectName("muted")
-        find_btns.addWidget(self._find_btn)
-        find_btns.addWidget(self._targets_label)
-        find_btns.addStretch()
-        targets_layout.addLayout(find_btns)
+        find_row.addWidget(self._find_btn)
+        find_row.addWidget(self._targets_label, 1)
+        layout.addLayout(find_row)
 
         self._targets_list = QTreeWidget()
         self._targets_list.setHeaderLabels(["File", "Format", "Size", "Quality"])
@@ -180,11 +202,8 @@ class ReencodeTab(QWidget):
         self._targets_list.setColumnWidth(1, 70)
         self._targets_list.setColumnWidth(2, 80)
         self._targets_list.setColumnWidth(3, 160)
-        self._targets_list.setMaximumHeight(200)
-        targets_layout.addWidget(self._targets_list)
-        layout.addWidget(targets_group)
+        layout.addWidget(self._targets_list, 1)
 
-        # Action buttons
         btn_row = QHBoxLayout()
         self._start_btn = QPushButton("Start Reencode")
         self._start_btn.setObjectName("primary")
@@ -198,7 +217,6 @@ class ReencodeTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        # Progress
         self._progress_bar = QProgressBar()
         self._progress_bar.setVisible(False)
         self._progress_label = QLabel("")
@@ -207,10 +225,11 @@ class ReencodeTab(QWidget):
         layout.addWidget(self._progress_bar)
         layout.addWidget(self._progress_label)
 
-        # Log
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         layout.addWidget(self._log)
+
+        return w
 
     def _save_settings(self, *_):
         fmt = self._fmt_combo.currentData() or "mp3"
