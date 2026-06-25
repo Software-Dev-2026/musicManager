@@ -30,7 +30,7 @@ from ..core.metadata import (
     clean_file_tags, read_tags, write_tags,
     read_quick_meta, compute_dest_dir, sanitize_name,
 )
-from ..workers.metadata_worker import NormalizeWorker
+from ..workers.metadata_worker import NormalizeWorker, OrganizeWorker
 from .styles import COLORS, make_vdivider
 
 from ..core.config import _CACHE_DIR
@@ -450,23 +450,56 @@ class LibraryTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        # Batch normalize
-        batch_group = QGroupBox("Batch Normalize Library")
+        # Batch operations
+        batch_group = QGroupBox("Batch Operations")
         batch_layout = QVBoxLayout(batch_group)
-        desc = QLabel("Sets artist / album artist / album for every file based on the folder structure.")
-        desc.setObjectName("muted")
-        desc.setWordWrap(True)
-        batch_layout.addWidget(desc)
-        batch_btns = QHBoxLayout()
-        self._batch_btn = QPushButton("Run Batch Normalize")
+
+        ops_row = QHBoxLayout()
+        ops_row.setSpacing(12)
+
+        # Left: Normalize tags from folders
+        norm_box = QGroupBox("Normalize Tags from Folders")
+        norm_layout = QVBoxLayout(norm_box)
+        norm_desc = QLabel(
+            "Reads the folder and subfolder names and writes them as artist and album tags.\n"
+            "Does not move or rename any files."
+        )
+        norm_desc.setObjectName("muted")
+        norm_desc.setWordWrap(True)
+        norm_layout.addWidget(norm_desc)
+        norm_layout.addStretch()
+        self._batch_btn = QPushButton("Run Normalize")
         self._batch_btn.clicked.connect(self._batch_normalize)
+        norm_layout.addWidget(self._batch_btn)
+        ops_row.addWidget(norm_box)
+
+        # Right: Organize files by tags
+        org_box = QGroupBox("Organize Files by Tags")
+        org_layout = QVBoxLayout(org_box)
+        org_desc = QLabel(
+            "Reads the artist and album tags from each file and moves it into the matching "
+            "folder structure.\n"
+            "Does not edit any tags."
+        )
+        org_desc.setObjectName("muted")
+        org_desc.setWordWrap(True)
+        org_layout.addWidget(org_desc)
+        org_layout.addStretch()
+        self._organize_btn = QPushButton("Run Organize")
+        self._organize_btn.clicked.connect(self._batch_organize)
+        org_layout.addWidget(self._organize_btn)
+        ops_row.addWidget(org_box)
+
+        batch_layout.addLayout(ops_row)
+
+        cancel_row = QHBoxLayout()
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._cancel_batch)
-        batch_btns.addWidget(self._batch_btn)
-        batch_btns.addWidget(self._cancel_btn)
-        batch_btns.addStretch()
-        batch_layout.addLayout(batch_btns)
+        cancel_row.addWidget(self._cancel_btn)
+        cancel_row.addStretch()
+        batch_layout.addLayout(cancel_row)
+
         self._batch_progress = QProgressBar()
         self._batch_progress.setVisible(False)
         batch_layout.addWidget(self._batch_progress)
@@ -618,16 +651,23 @@ class LibraryTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
 
-    # ── Batch normalize ───────────────────────────────────────────────────────
+    # ── Batch operations ──────────────────────────────────────────────────────
 
-    def _batch_normalize(self):
-        if self._worker and self._worker.isRunning():
-            return
+    def _is_batch_running(self) -> bool:
+        return bool(self._worker and self._worker.isRunning())
+
+    def _start_batch(self):
         self._batch_btn.setEnabled(False)
+        self._organize_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._batch_progress.setVisible(True)
         self._batch_progress.setValue(0)
         self._batch_log.clear()
+
+    def _batch_normalize(self):
+        if self._is_batch_running():
+            return
+        self._start_batch()
         self._worker = NormalizeWorker(
             self.config.music_dir,
             set(self.config.skip_dirs),
@@ -635,7 +675,32 @@ class LibraryTab(QWidget):
         )
         self._worker.progress.connect(self._on_batch_progress)
         self._worker.log.connect(lambda msg: self._batch_log.append(msg))
-        self._worker.finished.connect(self._on_batch_done)
+        self._worker.finished.connect(self._on_normalize_done)
+        self._worker.error.connect(self._on_batch_error)
+        self._worker.start()
+
+    def _batch_organize(self):
+        if self._is_batch_running():
+            return
+        reply = QMessageBox.question(
+            self, "Organize Files by Tags",
+            "This will move files into folders based on their artist and album tags.\n"
+            "Files with no artist tag will be skipped.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._start_batch()
+        self._worker = OrganizeWorker(
+            self.config.music_dir,
+            self.config.library_structure,
+            set(self.config.skip_dirs),
+            self.config.audio_extensions,
+        )
+        self._worker.progress.connect(self._on_batch_progress)
+        self._worker.log.connect(lambda msg: self._batch_log.append(msg))
+        self._worker.finished.connect(self._on_organize_done)
         self._worker.error.connect(self._on_batch_error)
         self._worker.start()
 
@@ -644,25 +709,39 @@ class LibraryTab(QWidget):
             self._batch_progress.setMaximum(total)
             self._batch_progress.setValue(current)
 
-    def _on_batch_done(self, result: dict):
+    def _finish_batch(self):
         self._batch_btn.setEnabled(True)
+        self._organize_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._batch_progress.setVisible(False)
+
+    def _on_normalize_done(self, result: dict):
+        self._finish_batch()
         self._batch_log.append(f"\nDone. Changed: {result['changed']}  Skipped: {result['skipped']}")
         self._tree.refresh()
         if self._current_file:
             self.load_file(self._current_file)
 
+    def _on_organize_done(self, result: dict):
+        self._finish_batch()
+        errors = result.get("errors", [])
+        self._batch_log.append(
+            f"\nDone. Moved: {result['moved']}  Skipped: {result['skipped']}  Errors: {len(errors)}"
+        )
+        for e in errors:
+            self._batch_log.append(f"  {e}")
+        self._tree.refresh()
+        if self._current_file:
+            self.load_file(self._current_file)
+
     def _on_batch_error(self, msg: str):
-        self._batch_btn.setEnabled(True)
-        self._cancel_btn.setEnabled(False)
+        self._finish_batch()
         self._batch_log.append(f"ERROR: {msg}")
 
     def _cancel_batch(self):
         if self._worker:
             self._worker.cancel()
-        self._batch_btn.setEnabled(True)
-        self._cancel_btn.setEnabled(False)
+        self._finish_batch()
 
     # ── Tab visibility ────────────────────────────────────────────────────────
 

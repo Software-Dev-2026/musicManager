@@ -1,4 +1,5 @@
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -258,3 +259,57 @@ def batch_normalize(music_dir: Path, skip_dirs: set, extensions: set,
             else:
                 skipped += 1
     return changed, skipped
+
+
+def _prune_empty_dir(directory: Path, stop_at: Path):
+    """Remove directory and its empty parents up to (but not including) stop_at."""
+    path = directory.resolve()
+    root = stop_at.resolve()
+    while path != root and path.is_relative_to(root):
+        try:
+            path.rmdir()
+        except OSError:
+            break
+        path = path.parent
+
+
+def batch_organize(music_dir: Path, structure: str, skip_dirs: set, extensions: set,
+                   progress_cb=None, cancel_fn=None) -> tuple[int, int, list]:
+    """Move every audio file into the folder dictated by its artist/album tags.
+
+    Does not edit tags. Files with no artist tag are skipped.
+    Returns (moved, skipped, errors).
+    """
+    files = collect_audio_files(music_dir, skip_dirs, extensions)
+    moved = skipped = 0
+    errors: list[str] = []
+    for i, f in enumerate(files):
+        if cancel_fn and cancel_fn():
+            break
+        if progress_cb:
+            progress_cb(i, len(files), f.name)
+        try:
+            mf = mutagen.File(f, easy=True)
+            if mf is None:
+                skipped += 1
+                continue
+            artist = (mf.get("artist") or mf.get("albumartist") or [""])[0].strip()
+            album = (mf.get("album") or [""])[0].strip()
+            if not artist:
+                skipped += 1
+                continue
+            dest = compute_dest_dir(music_dir, structure, artist, album) / f.name
+            if dest.resolve() == f.resolve():
+                skipped += 1
+                continue
+            if dest.exists():
+                errors.append(f"{f.name}: destination already exists, skipped")
+                skipped += 1
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(dest))
+            _prune_empty_dir(f.parent, music_dir)
+            moved += 1
+        except Exception as e:
+            errors.append(f"{f.name}: {e}")
+    return moved, skipped, errors
