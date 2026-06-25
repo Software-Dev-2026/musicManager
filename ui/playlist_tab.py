@@ -1,191 +1,805 @@
 from pathlib import Path
 
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTextEdit, QSplitter,
-    QFileDialog, QMessageBox, QGroupBox, QListWidget,
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
     QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QStackedWidget,
+    QStyle,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 
 from ..core.config import Config
 from ..core.downloader import decode_playlist
+from .library_tab import LibraryTree
+
+_OK_COLOR = QColor("#3fb950")
+_MISS_COLOR = QColor("#f85149")
+
+
+class _TrackInfoWorker(QThread):
+    progress = pyqtSignal(int, int)  # current, total
+    result = pyqtSignal(list)  # list[dict] of built entries
+
+    def __init__(self, paths: list[str], parent=None):
+        super().__init__(parent)
+        self._paths = paths
+
+    def run(self):
+        total = len(self._paths)
+        entries = []
+        for i, p in enumerate(self._paths):
+            path = Path(p)
+            title, dur = _read_track_info(path)
+            entries.append(
+                {
+                    "raw": p,
+                    "path": p,
+                    "title": title,
+                    "duration": dur,
+                    "exists": path.exists(),
+                }
+            )
+            self.progress.emit(i + 1, total)
+        self.result.emit(entries)
+
+
+class _LibraryPickerDialog(QDialog):
+    """Modal dialog with the library tree for selecting songs to add."""
+
+    def __init__(self, config: Config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Songs from Library")
+        self.resize(480, 560)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        search = QLineEdit()
+        search.setPlaceholderText("Filter…")
+        layout.addWidget(search)
+
+        self._tree = LibraryTree(config, compact=True, multi_select=True)
+        layout.addWidget(self._tree)
+        self._tree.refresh()
+        search.textChanged.connect(self._tree.filter)
+
+        hint = QLabel("Hold Ctrl or Shift to select multiple songs.")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_paths(self) -> list[str]:
+        def collect(item) -> list[str]:
+            if item.isHidden():
+                return []
+            path = item.data(0, Qt.ItemDataRole.UserRole)
+            if path:
+                return [path]
+            result = []
+            for i in range(item.childCount()):
+                result.extend(collect(item.child(i)))
+            return result
+
+        seen: set[str] = set()
+        paths: list[str] = []
+        for item in self._tree.selectedItems():
+            for p in collect(item):
+                if p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+        return paths
+
+
+def _read_track_info(path: Path) -> tuple[str, int]:
+    """Return (title, duration_seconds) from audio tags. Falls back to stem / -1."""
+    try:
+        import mutagen
+
+        f = mutagen.File(path, easy=True)
+        if f is None:
+            return path.stem, -1
+        title = (f.get("title") or [None])[0] or path.stem
+        dur = int(f.info.length) if hasattr(f, "info") and hasattr(f.info, "length") else -1
+        return title, dur
+    except Exception:
+        return path.stem, -1
+
+
+def _parse_m3u(playlist_path: Path) -> list[dict]:
+    try:
+        raw = playlist_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    raw = decode_playlist(raw)
+    entries, title, duration = [], None, -1
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXTINF:"):
+            rest = line[8:]
+            comma = rest.find(",")
+            if comma >= 0:
+                try:
+                    duration = int(float(rest[:comma]))
+                except ValueError:
+                    duration = -1
+                title = rest[comma + 1 :].strip()
+            else:
+                title, duration = rest, -1
+        elif line.startswith("#"):
+            continue
+        else:
+            p = Path(line.replace("\\", "/"))
+            if not p.is_absolute():
+                p = (playlist_path.parent / p).resolve()
+            entries.append(
+                {
+                    "raw": line,
+                    "path": str(p),
+                    "title": title or p.stem,
+                    "duration": duration,
+                    "exists": p.exists(),
+                }
+            )
+            title, duration = None, -1
+    return entries
+
+
+def _write_m3u(playlist_path: Path, entries: list[dict]) -> None:
+    base = playlist_path.parent
+    lines = ["#EXTM3U"]
+    for e in entries:
+        lines.append(f"#EXTINF:{e.get('duration', -1)},{e.get('title', '')}")
+        try:
+            lines.append(str(Path(e["path"]).relative_to(base)))
+        except ValueError:
+            lines.append(Path(e["path"]).name)
+    playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _fmt_duration(total_secs: int) -> str:
+    if total_secs <= 0:
+        return "unknown duration"
+    h, r = divmod(total_secs, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+
+class _PlaylistTree(QTreeWidget):
+    reordered = pyqtSignal()
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        # Flatten any items accidentally nested under another item
+        i = 0
+        while i < self.topLevelItemCount():
+            item = self.topLevelItem(i)
+            insert_at = i + 1
+            while item.childCount():
+                self.insertTopLevelItem(insert_at, item.takeChild(0))
+                insert_at += 1
+            i += 1
+        self.reordered.emit()
 
 
 class PlaylistTab(QWidget):
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.config = config
-        self._original_text: str = ""
-        self._fixed_text: str = ""
-        self._current_path: str | None = None
+        self._entries: list[dict] = []
+        self._playlist_path: Path | None = None
+        self._dirty = False
+        self._undo_stack: list[list[dict]] = []
+        self._redo_stack: list[list[dict]] = []
+        self._picker_dialog: _LibraryPickerDialog | None = None
         self._setup_ui()
         self._scan_playlists()
 
+    # ── Layout ────────────────────────────────────────────────────────────────
+
     def _setup_ui(self):
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
-        outer.setSpacing(12)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # ── Left panel: playlist list ────────────────────────────────────────
-        left = QWidget()
-        left.setMaximumWidth(280)
-        left.setMinimumWidth(180)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        outer.addWidget(self._build_left())
 
-        lbl = QLabel("Playlists")
-        lbl.setObjectName("section_header")
-        left_layout.addWidget(lbl)
-
-        self._playlist_list = QListWidget()
-        self._playlist_list.itemClicked.connect(self._load_from_list)
-        left_layout.addWidget(self._playlist_list)
-
-        list_btns = QHBoxLayout()
-        self._scan_btn = QPushButton("Scan Library")
-        self._scan_btn.clicked.connect(self._scan_playlists)
-        open_btn = QPushButton("Open…")
-        open_btn.clicked.connect(self._browse_open)
-        list_btns.addWidget(self._scan_btn)
-        list_btns.addWidget(open_btn)
-        left_layout.addLayout(list_btns)
-
-        outer.addWidget(left)
-
-        # Divider
         div = QWidget()
         div.setFixedWidth(1)
         div.setStyleSheet("background:#30363d;")
         outer.addWidget(div)
 
-        # ── Right panel: before/after view ───────────────────────────────────
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        outer.addWidget(self._build_right())
 
-        self._file_label = QLabel("No playlist loaded")
-        self._file_label.setObjectName("muted")
-        self._file_label.setWordWrap(True)
-        right_layout.addWidget(self._file_label)
+        self._track_list.installEventFilter(self)
+        self._playlist_list.installEventFilter(self)
+        self._track_list.reordered.connect(self._on_rows_moved)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        mono = QFont("Monospace", 10)
+        QShortcut(QKeySequence.StandardKey.Undo, self).activated.connect(self._undo)
+        QShortcut(QKeySequence.StandardKey.Redo, self).activated.connect(self._redo)
 
-        orig_group = QGroupBox("Original")
-        orig_layout = QVBoxLayout(orig_group)
-        self._orig_view = QTextEdit()
-        self._orig_view.setReadOnly(True)
-        self._orig_view.setFont(mono)
-        orig_layout.addWidget(self._orig_view)
-        splitter.addWidget(orig_group)
+    def _build_left(self) -> QWidget:
+        left = QWidget()
+        left.setFixedWidth(240)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(8, 12, 4, 12)
+        ll.setSpacing(8)
 
-        fixed_group = QGroupBox("Fixed (URL Decoded)")
-        fixed_layout = QVBoxLayout(fixed_group)
-        self._fixed_view = QTextEdit()
-        self._fixed_view.setReadOnly(True)
-        self._fixed_view.setFont(mono)
-        fixed_layout.addWidget(self._fixed_view)
-        splitter.addWidget(fixed_group)
+        # Header row — matches height of right panel's header row
+        hdr_row = QHBoxLayout()
+        hdr = QLabel("Playlists")
+        hdr.setObjectName("section_header")
+        hdr_row.addWidget(hdr, 1)
+        scan_btn = QPushButton("Scan")
+        scan_btn.clicked.connect(self._scan_playlists)
+        hdr_row.addWidget(scan_btn)
+        ll.addLayout(hdr_row)
 
-        splitter.setSizes([500, 500])
-        right_layout.addWidget(splitter)
-
-        self._stats_label = QLabel("")
-        self._stats_label.setObjectName("muted")
-        right_layout.addWidget(self._stats_label)
+        self._playlist_list = QListWidget()
+        self._playlist_list.itemClicked.connect(self._on_playlist_clicked)
+        ll.addWidget(self._playlist_list)
 
         btn_row = QHBoxLayout()
-        self._fix_btn = QPushButton("Save Fixed As…")
-        self._fix_btn.setObjectName("primary")
-        self._fix_btn.setEnabled(False)
-        self._fix_btn.clicked.connect(self._save_fixed)
-        self._overwrite_btn = QPushButton("Overwrite Original")
-        self._overwrite_btn.setObjectName("danger")
-        self._overwrite_btn.setEnabled(False)
-        self._overwrite_btn.clicked.connect(self._overwrite)
-        btn_row.addWidget(self._fix_btn)
-        btn_row.addWidget(self._overwrite_btn)
-        btn_row.addStretch()
-        right_layout.addLayout(btn_row)
+        new_btn = QPushButton("New")
+        new_btn.clicked.connect(self._new_playlist)
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self._rename_playlist)
+        del_btn = QPushButton("Delete")
+        del_btn.setObjectName("danger")
+        del_btn.clicked.connect(self._delete_playlist)
+        btn_row.addWidget(new_btn)
+        btn_row.addWidget(rename_btn)
+        btn_row.addWidget(del_btn)
+        ll.addLayout(btn_row)
 
-        outer.addWidget(right)
+        return left
+
+    def _build_right(self) -> QWidget:
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(12, 12, 12, 12)
+        rl.setSpacing(8)
+
+        # Header: path + Fix Encoding button
+        header_row = QHBoxLayout()
+        self._path_label = QLabel("No playlist selected")
+        self._path_label.setObjectName("muted")
+        self._path_label.setWordWrap(True)
+        header_row.addWidget(self._path_label, 1)
+        self._fix_btn = QPushButton("Fix Encoding")
+        self._fix_btn.setEnabled(False)
+        self._fix_btn.clicked.connect(self._fix_encoding)
+        self._fix_btn.setToolTip("URL-decode %xx sequences in file paths within the playlist")
+        header_row.addWidget(self._fix_btn)
+        rl.addLayout(header_row)
+
+        # Track list
+        self._track_list = _PlaylistTree()
+        self._track_list.setHeaderLabels(["", "#", "Title", "Status"])
+        self._track_list.setColumnWidth(0, 20)
+        self._track_list.setColumnWidth(1, 40)
+        self._track_list.setColumnWidth(2, 420)
+        self._track_list.setColumnWidth(3, 100)
+        self._track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._track_list.setAlternatingRowColors(True)
+        self._track_list.setDragEnabled(True)
+        self._track_list.setAcceptDrops(True)
+        self._track_list.setDropIndicatorShown(True)
+        self._track_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._track_list.itemDoubleClicked.connect(self._on_track_double_clicked)
+
+        _placeholder = QLabel("No playlist selected\n\nSelect or create a playlist from the left panel.")
+        _placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _placeholder.setObjectName("muted")
+        _placeholder.setWordWrap(True)
+
+        self._track_stack = QStackedWidget()
+        self._track_stack.addWidget(_placeholder)  # page 0 — no selection
+        self._track_stack.addWidget(self._track_list)  # page 1 — playlist loaded
+        rl.addWidget(self._track_stack)
+
+        self._add_progress = QProgressBar()
+        self._add_progress.setVisible(False)
+        self._add_progress.setTextVisible(False)
+        self._add_progress.setFixedHeight(4)
+        rl.addWidget(self._add_progress)
+
+        # Track action buttons
+        _style = QApplication.style()
+        track_btns = QHBoxLayout()
+        self._add_btn = QPushButton("Add Songs…")
+        self._add_btn.clicked.connect(self._add_songs)
+        add_btn = self._add_btn
+        rm_btn = QPushButton("Remove")
+        rm_btn.clicked.connect(self._remove_selected)
+        up_btn = QPushButton()
+        up_btn.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        up_btn.setFixedWidth(32)
+        up_btn.setToolTip("Move up")
+        up_btn.clicked.connect(self._move_up)
+        dn_btn = QPushButton()
+        dn_btn.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown))
+        dn_btn.setFixedWidth(32)
+        dn_btn.setToolTip("Move down")
+        dn_btn.clicked.connect(self._move_down)
+        rm_miss_btn = QPushButton("Remove Missing")
+        rm_miss_btn.clicked.connect(self._remove_missing)
+        dedup_btn = QPushButton("Remove Duplicates")
+        dedup_btn.clicked.connect(self._dedup)
+        sort_lbl = QLabel("Sort:")
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Unsorted", "By Title", "By Path", "By Duration"])
+        self._sort_combo.currentIndexChanged.connect(self._sort_tracks)
+        track_btns.addWidget(add_btn)
+        track_btns.addWidget(rm_btn)
+        track_btns.addWidget(up_btn)
+        track_btns.addWidget(dn_btn)
+        track_btns.addSpacing(12)
+        track_btns.addWidget(rm_miss_btn)
+        track_btns.addWidget(dedup_btn)
+        track_btns.addSpacing(12)
+        track_btns.addWidget(sort_lbl)
+        track_btns.addWidget(self._sort_combo)
+        track_btns.addStretch()
+        rl.addLayout(track_btns)
+
+        # Status bar + Save
+        status_row = QHBoxLayout()
+        self._stats_label = QLabel("")
+        self._stats_label.setObjectName("muted")
+        status_row.addWidget(self._stats_label, 1)
+        self._save_status_label = QLabel("")
+        self._save_status_label.setVisible(False)
+        status_row.addWidget(self._save_status_label)
+        self._save_btn = QPushButton("Save")
+        self._save_btn.setObjectName("primary")
+        self._save_btn.setVisible(False)
+        self._save_btn.clicked.connect(self._save)
+        status_row.addWidget(self._save_btn)
+        rl.addLayout(status_row)
+
+        return right
+
+    # ── Playlist sidebar ──────────────────────────────────────────────────────
 
     def _scan_playlists(self):
         self._playlist_list.clear()
         music_dir = self.config.music_dir
         if not music_dir.exists():
             return
-        found = sorted(music_dir.rglob("*.m3u")) + sorted(music_dir.rglob("*.m3u8"))
+        skip = set(self.config.skip_dirs)
+        found = sorted(
+            p
+            for pattern in ("*.m3u", "*.m3u8")
+            for p in music_dir.rglob(pattern)
+            if not (skip & set(p.relative_to(music_dir).parts))
+        )
         for path in found:
             item = QListWidgetItem(path.name)
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(str(path))
             self._playlist_list.addItem(item)
         if not found:
-            item = QListWidgetItem("(no playlists found)")
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self._playlist_list.addItem(item)
+            placeholder = QListWidgetItem("(no playlists found)")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._playlist_list.addItem(placeholder)
+        if self._picker_dialog is not None:
+            self._picker_dialog._tree.refresh()
 
-    def _load_from_list(self, item: QListWidgetItem):
+    def _on_playlist_clicked(self, item: QListWidgetItem):
         path = item.data(Qt.ItemDataRole.UserRole)
-        if path:
-            self._load_file(path)
+        if not path:
+            return
+        if not self._confirm_discard():
+            return
+        self._load_playlist(Path(path))
 
-    def _browse_open(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Playlist", str(self.config.music_dir),
-            "Playlists (*.m3u *.m3u8);;All Files (*)"
-        )
-        if path:
-            self._load_file(path)
+    def _new_playlist(self):
+        if not self._confirm_discard():
+            return
+        name, ok = QInputDialog.getText(self, "New Playlist", "Playlist name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not name.endswith((".m3u", ".m3u8")):
+            name += ".m3u"
+        dest = self.config.music_dir / name
+        if dest.exists():
+            QMessageBox.warning(self, "Already Exists", f"{dest.name} already exists.")
+            return
+        dest.write_text("#EXTM3U\n", encoding="utf-8")
+        self._scan_playlists()
+        self._select_in_list(dest)
+        self._load_playlist(dest)
 
-    def _load_file(self, path: str):
-        self._current_path = path
-        self._file_label.setText(path)
+    def _rename_playlist(self):
+        item = self._playlist_list.currentItem()
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            return
+        path = Path(item.data(Qt.ItemDataRole.UserRole))
+        name, ok = QInputDialog.getText(self, "Rename Playlist", "New name:", text=path.stem)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if not name.endswith((".m3u", ".m3u8")):
+            name += path.suffix
+        new_path = path.parent / name
+        if new_path.exists():
+            QMessageBox.warning(self, "Already Exists", f"{new_path.name} already exists.")
+            return
         try:
-            self._original_text = Path(path).read_text(encoding="utf-8", errors="replace")
+            path.rename(new_path)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             return
-        self._fixed_text = decode_playlist(self._original_text)
-        self._orig_view.setPlainText(self._original_text)
-        self._fixed_view.setPlainText(self._fixed_text)
+        if self._playlist_path == path:
+            self._playlist_path = new_path
+            self._path_label.setText(str(new_path))
+        self._scan_playlists()
+        self._select_in_list(new_path)
 
-        orig_lines = self._original_text.splitlines()
-        fixed_lines = self._fixed_text.splitlines()
-        changed = sum(1 for a, b in zip(orig_lines, fixed_lines) if a != b)
-        self._stats_label.setText(f"{len(orig_lines)} lines  |  {changed} line(s) decoded")
-        self._fix_btn.setEnabled(True)
-        self._overwrite_btn.setEnabled(self._original_text != self._fixed_text)
-
-    def _save_fixed(self):
-        if not self._fixed_text or not self._current_path:
+    def _delete_playlist(self):
+        item = self._playlist_list.currentItem()
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
             return
-        stem = Path(self._current_path).stem
-        default = str(Path(self._current_path).with_stem(stem + "_fixed"))
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Fixed Playlist", default,
-            "Playlists (*.m3u *.m3u8);;All Files (*)"
-        )
-        if path:
-            Path(path).write_text(self._fixed_text, encoding="utf-8")
-            QMessageBox.information(self, "Saved", f"Saved to:\n{path}")
-            self._scan_playlists()
-
-    def _overwrite(self):
+        path = Path(item.data(Qt.ItemDataRole.UserRole))
         reply = QMessageBox.question(
-            self, "Overwrite",
-            f"Overwrite original file?\n{self._current_path}",
+            self,
+            "Delete Playlist",
+            f"Permanently delete {path.name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            path.unlink()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        self._scan_playlists()
+        if self._playlist_path == path:
+            self._playlist_path = None
+            self._entries = []
+            self._dirty = False
+            self._track_list.clear()
+            self._track_stack.setCurrentIndex(0)
+            self._path_label.setText("No playlist selected")
+            self._stats_label.setText("")
+            self._save_btn.setVisible(False)
+            self._save_status_label.setVisible(False)
+            self._fix_btn.setEnabled(False)
+
+    def _select_in_list(self, path: Path):
+        for i in range(self._playlist_list.count()):
+            item = self._playlist_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == str(path):
+                self._playlist_list.setCurrentItem(item)
+                break
+
+    # ── Loading / display ─────────────────────────────────────────────────────
+
+    def _load_playlist(self, path: Path):
+        self._playlist_path = path
+        self._entries = _parse_m3u(path)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        # Mark dirty immediately if any entry uses an absolute path so that
+        # saving will rewrite them as relative paths.
+        has_absolute = any(Path(e["raw"]).is_absolute() for e in self._entries)
+        self._dirty = has_absolute
+        # Absolute paths that fall outside the library directory are unreachable;
+        # treat them as missing even if the file exists on disk.
+        music_dir = self.config.music_dir.resolve()
+        for e in self._entries:
+            if e["exists"] and Path(e["raw"]).is_absolute():
+                try:
+                    Path(e["path"]).resolve().relative_to(music_dir)
+                except ValueError:
+                    e["exists"] = False
+        self._path_label.setText(str(path))
+        self._fix_btn.setEnabled(True)
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.setCurrentIndex(0)
+        self._sort_combo.blockSignals(False)
+        self._save_status_label.setVisible(False)
+        self._save_btn.setVisible(has_absolute)
+        if has_absolute:
+            self._save_status_label.setText("Unsaved changes")
+            self._save_status_label.setStyleSheet("color: #d29922;")
+            self._save_status_label.setVisible(True)
+        self._track_stack.setCurrentIndex(1)
+        self._populate_track_list()
+
+    def _populate_track_list(self):
+        self._track_list.clear()
+        self._entries_snapshot = list(self._entries)
+        _handle_color = QColor("#484f58")
+        for i, e in enumerate(self._entries):
+            status = "✓" if e["exists"] else "✗  Missing"
+            item = QTreeWidgetItem(self._track_list, ["⠿", str(i + 1), e["title"], status])
+            item.setData(0, Qt.ItemDataRole.UserRole, i)
+            item.setToolTip(2, e["path"])
+            item.setForeground(0, _handle_color)
+            color = _OK_COLOR if e["exists"] else _MISS_COLOR
+            item.setForeground(3, color)
+            if not e["exists"]:
+                item.setForeground(2, _MISS_COLOR)
+        self._update_stats()
+
+    def _on_rows_moved(self, *_):
+        # Push the pre-drag state (snapshot was captured at last populate)
+        self._undo_stack.append([dict(e) for e in self._entries_snapshot])
+        self._redo_stack.clear()
+        snapshot = self._entries_snapshot
+        new_entries = []
+        for i in range(self._track_list.topLevelItemCount()):
+            tree_item = self._track_list.topLevelItem(i)
+            orig_idx = tree_item.data(0, Qt.ItemDataRole.UserRole)
+            new_entries.append(snapshot[orig_idx])
+            tree_item.setText(1, str(i + 1))
+        self._entries = new_entries
+        self._entries_snapshot = list(new_entries)
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.setCurrentIndex(0)
+        self._sort_combo.blockSignals(False)
+        self._update_stats()
+        self._mark_dirty()
+
+    def _update_stats(self):
+        n = len(self._entries)
+        missing = sum(1 for e in self._entries if not e["exists"])
+        total_secs = sum(e.get("duration") or 0 for e in self._entries if (e.get("duration") or 0) > 0)
+        self._stats_label.setText(f"{n} tracks · {n - missing} found · {missing} missing · {_fmt_duration(total_secs)}")
+
+    def _on_track_double_clicked(self, item: QTreeWidgetItem, _col: int):
+        path = self._entries[self._track_list.indexOfTopLevelItem(item)]["path"]
+        QMessageBox.information(self, "File Path", path)
+
+    # ── Track editing ─────────────────────────────────────────────────────────
+
+    def _add_songs(self):
+        if self._playlist_path is None:
+            return
+        if self._picker_dialog is None:
+            self._picker_dialog = _LibraryPickerDialog(self.config, self)
+        self._picker_dialog._tree.clearSelection()
+        if self._picker_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        paths = self._picker_dialog.selected_paths()
+        if not paths:
+            return
+        self._push_undo()
+        self._add_btn.setEnabled(False)
+        self._add_progress.setRange(0, len(paths))
+        self._add_progress.setValue(0)
+        self._add_progress.setVisible(True)
+        self._add_worker = _TrackInfoWorker(paths, self)
+        self._add_worker.progress.connect(lambda cur, _tot: self._add_progress.setValue(cur))
+        self._add_worker.result.connect(self._on_add_done)
+        self._add_worker.start()
+
+    def _on_add_done(self, new_entries: list):
+        self._entries.extend(new_entries)
+        self._add_progress.setVisible(False)
+        self._add_btn.setEnabled(True)
+        self._mark_dirty()
+        self._populate_track_list()
+
+    def _remove_selected(self):
+        rows = sorted(
+            {self._track_list.indexOfTopLevelItem(i) for i in self._track_list.selectedItems()},
+            reverse=True,
+        )
+        if not rows:
+            return
+        self._push_undo()
+        for r in rows:
+            if 0 <= r < len(self._entries):
+                self._entries.pop(r)
+        self._mark_dirty()
+        self._populate_track_list()
+
+    def _move_up(self):
+        rows = sorted({self._track_list.indexOfTopLevelItem(i) for i in self._track_list.selectedItems()})
+        if not rows or rows[0] == 0:
+            return
+        self._push_undo()
+        for r in rows:
+            self._entries[r - 1], self._entries[r] = self._entries[r], self._entries[r - 1]
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.setCurrentIndex(0)
+        self._sort_combo.blockSignals(False)
+        self._mark_dirty()
+        self._populate_track_list()
+        for r in rows:
+            self._track_list.topLevelItem(r - 1).setSelected(True)
+
+    def _move_down(self):
+        rows = sorted(
+            {self._track_list.indexOfTopLevelItem(i) for i in self._track_list.selectedItems()},
+            reverse=True,
+        )
+        if not rows or rows[0] >= len(self._entries) - 1:
+            return
+        self._push_undo()
+        for r in rows:
+            self._entries[r], self._entries[r + 1] = self._entries[r + 1], self._entries[r]
+        self._sort_combo.blockSignals(True)
+        self._sort_combo.setCurrentIndex(0)
+        self._sort_combo.blockSignals(False)
+        self._mark_dirty()
+        self._populate_track_list()
+        for r in rows:
+            self._track_list.topLevelItem(r + 1).setSelected(True)
+
+    def _remove_missing(self):
+        before = len(self._entries)
+        filtered = [e for e in self._entries if e["exists"]]
+        removed = before - len(filtered)
+        if removed:
+            self._push_undo()
+            self._entries = filtered
+            self._mark_dirty()
+            self._populate_track_list()
+            QMessageBox.information(self, "Removed", f"Removed {removed} missing track(s).")
+        else:
+            QMessageBox.information(self, "None Missing", "All tracks are present on disk.")
+
+    def _dedup(self):
+        seen: set[str] = set()
+        unique = []
+        for e in self._entries:
+            key = e["path"].lower()
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
+        removed = len(self._entries) - len(unique)
+        if removed:
+            self._push_undo()
+            self._entries = unique
+            self._mark_dirty()
+            self._populate_track_list()
+            QMessageBox.information(self, "Duplicates Removed", f"Removed {removed} duplicate(s).")
+        else:
+            QMessageBox.information(self, "No Duplicates", "No duplicate entries found.")
+
+    def _sort_tracks(self, index: int):
+        if not self._entries or index == 0:
+            return
+        self._push_undo()
+        key_fns = [
+            None,
+            lambda e: e["title"].lower(),
+            lambda e: e["path"].lower(),
+            lambda e: e.get("duration") or -1,
+        ]
+        self._entries.sort(key=key_fns[index])
+        self._mark_dirty()
+        self._populate_track_list()
+
+    # ── Playlist tools ────────────────────────────────────────────────────────
+
+    def _fix_encoding(self):
+        if not self._playlist_path:
+            return
+        try:
+            original = self._playlist_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        fixed = decode_playlist(original)
+        if original == fixed:
+            QMessageBox.information(self, "Fix Encoding", "No URL-encoded sequences found.")
+            return
+        changed = sum(1 for a, b in zip(original.splitlines(), fixed.splitlines()) if a != b)
+        reply = QMessageBox.question(
+            self,
+            "Fix Encoding",
+            f"{changed} line(s) contain URL-encoded paths. Decode and save?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            Path(self._current_path).write_text(self._fixed_text, encoding="utf-8")
-            self._original_text = self._fixed_text
-            self._orig_view.setPlainText(self._original_text)
-            self._overwrite_btn.setEnabled(False)
-            self._stats_label.setText("File overwritten — no more differences.")
-            QMessageBox.information(self, "Done", "File overwritten.")
+            self._playlist_path.write_text(fixed, encoding="utf-8")
+            self._load_playlist(self._playlist_path)
+
+    def _save(self):
+        if not self._playlist_path:
+            return
+        try:
+            _write_m3u(self._playlist_path, self._entries)
+            # Reload from the written file so raw/path/exists reflect the saved state.
+            self._entries = _parse_m3u(self._playlist_path)
+            music_dir = self.config.music_dir.resolve()
+            for e in self._entries:
+                if e["exists"] and Path(e["raw"]).is_absolute():
+                    try:
+                        Path(e["path"]).resolve().relative_to(music_dir)
+                    except ValueError:
+                        e["exists"] = False
+            self._dirty = False
+            self._save_btn.setVisible(False)
+            self._save_status_label.setText("Saved")
+            self._save_status_label.setStyleSheet("color: #3fb950;")
+            self._save_status_label.setVisible(True)
+            QTimer.singleShot(3000, lambda: self._save_status_label.setVisible(False))
+            self._populate_track_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    # ── Event filter ─────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if obj is self._track_list:
+                self._remove_selected()
+                return True
+            if obj is self._playlist_list:
+                self._delete_playlist()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _push_undo(self):
+        self._undo_stack.append([dict(e) for e in self._entries])
+        self._redo_stack.clear()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append([dict(e) for e in self._entries])
+        self._entries = self._undo_stack.pop()
+        self._mark_dirty()
+        self._populate_track_list()
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append([dict(e) for e in self._entries])
+        self._entries = self._redo_stack.pop()
+        self._mark_dirty()
+        self._populate_track_list()
+
+    def _mark_dirty(self):
+        self._dirty = True
+        self._save_status_label.setText("Unsaved changes")
+        self._save_status_label.setStyleSheet("color: #d29922;")
+        self._save_status_label.setVisible(True)
+        self._save_btn.setVisible(True)
+
+    def _confirm_discard(self) -> bool:
+        if not self._dirty:
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Unsaved Changes")
+        msg.setText("You have unsaved changes to the current playlist.")
+        save_btn = msg.addButton("Save", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Discard", QMessageBox.ButtonRole.DestructiveRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == save_btn:
+            self._save()
+            return True
+        return clicked == discard_btn
