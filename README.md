@@ -62,17 +62,34 @@ pip install PyQt6 mutagen pysmb
 
 These must be on your `PATH`.
 
-On Fedora/RHEL:
+**Fedora/RHEL:**
 ```
 sudo dnf install chromaprint ffmpeg
 pip install yt-dlp
 ```
 
-On Debian/Ubuntu:
+**Debian/Ubuntu:**
 ```
 sudo apt install libchromaprint-tools ffmpeg
 pip install yt-dlp
 ```
+
+**macOS (Homebrew):**
+```
+brew install chromaprint ffmpeg yt-dlp
+```
+
+**Windows:**
+
+- ffmpeg: download from [ffmpeg.org](https://ffmpeg.org/download.html) and add the `bin` folder to your `PATH`, or install via winget:
+  ```
+  winget install Gyan.FFmpeg
+  ```
+- fpcalc: download the Chromaprint binary from [acoustid.org/chromaprint](https://acoustid.org/chromaprint) and place `fpcalc.exe` somewhere on your `PATH`.
+- yt-dlp:
+  ```
+  pip install yt-dlp
+  ```
 
 ---
 
