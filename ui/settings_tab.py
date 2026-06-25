@@ -92,13 +92,19 @@ class SettingsTab(QWidget):
 
         # ── Sync ─────────────────────────────────────────────────────────────
         smb_group = QGroupBox("Sync")
-        smb_form = QFormLayout(smb_group)
+        sync_layout = QVBoxLayout(smb_group)
 
+        mode_form = QFormLayout()
         self._sync_mode_combo = QComboBox()
         self._sync_mode_combo.addItem("Server (SMB/NAS)", "server")
         self._sync_mode_combo.addItem("Local Folder", "folder")
-        smb_form.addRow("Mode:", self._sync_mode_combo)
+        self._sync_mode_combo.currentIndexChanged.connect(self._update_sync_fields)
+        mode_form.addRow("Mode:", self._sync_mode_combo)
+        sync_layout.addLayout(mode_form)
 
+        self._smb_fields = QWidget()
+        smb_form = QFormLayout(self._smb_fields)
+        smb_form.setContentsMargins(0, 4, 0, 0)
         self._smb_host = QLineEdit()
         self._smb_host.setPlaceholderText("hostname or IP")
         smb_form.addRow("Host:", self._smb_host)
@@ -109,24 +115,25 @@ class SettingsTab(QWidget):
         smb_form.addRow("Username:", self._smb_user)
         self._smb_pass = _PasswordEdit()
         smb_form.addRow("Password:", self._smb_pass)
-
         note = QLabel("Password is stored obfuscated (XOR+Base64) in the config file.")
         note.setObjectName("muted")
         smb_form.addRow("", note)
-        layout.addWidget(smb_group)
+        sync_layout.addWidget(self._smb_fields)
 
-        # ── Folder Sync ──────────────────────────────────────────────────────
-        folder_group = QGroupBox("Sync — Folder Destination")
-        folder_form = QFormLayout(folder_group)
+        self._folder_fields = QWidget()
+        folder_form = QFormLayout(self._folder_fields)
+        folder_form.setContentsMargins(0, 4, 0, 0)
         dest_row = QHBoxLayout()
         self._folder_dest = QLineEdit()
-        self._folder_dest.setPlaceholderText("Default destination folder")
+        self._folder_dest.setPlaceholderText("Destination folder")
         browse_dest = QPushButton("Browse…")
         browse_dest.clicked.connect(self._browse_folder_dest)
         dest_row.addWidget(self._folder_dest)
         dest_row.addWidget(browse_dest)
         folder_form.addRow("Destination:", dest_row)
-        layout.addWidget(folder_group)
+        sync_layout.addWidget(self._folder_fields)
+
+        layout.addWidget(smb_group)
 
         # ── Duplicate Finder ─────────────────────────────────────────────────
         dupe_group = QGroupBox("Duplicate Finder")
@@ -229,6 +236,7 @@ class SettingsTab(QWidget):
         self._dl_embed_thumb.setChecked(bool(self.config.get("download.embed_thumbnail")))
         self._dl_add_meta.setChecked(bool(self.config.get("download.add_metadata")))
         self._prio_dirs.set_items(self.config.dupes_priority_dirs)
+        self._update_sync_fields()
         self._dirty = False
 
     def _browse_music_dir(self):
@@ -254,6 +262,11 @@ class SettingsTab(QWidget):
                                                  self._dl_staging.text())
         if path:
             self._dl_staging.setText(path)
+
+    def _update_sync_fields(self):
+        is_server = self._sync_mode_combo.currentData() == "server"
+        self._smb_fields.setVisible(is_server)
+        self._folder_fields.setVisible(not is_server)
 
     def _mark_dirty(self, *_):
         self._dirty = True
