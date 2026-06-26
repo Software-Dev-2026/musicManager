@@ -1,7 +1,8 @@
-import json
 import subprocess
 from pathlib import Path
 from typing import Callable
+
+from .cache import load_json, save_json
 
 
 FORMAT_RANK = {".flac": 4, ".wav": 3, ".m4a": 2, ".mp3": 2, ".ogg": 1, ".opus": 1}
@@ -41,19 +42,6 @@ def similarity(fp1: list, fp2: list) -> float:
     return 1.0 - diff / (length * 32)
 
 
-def load_cache(path: Path) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_cache(path: Path, cache: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache))
-
 
 def collect_files(root: Path, skip_dirs: set, extensions: set) -> list[Path]:
     files = []
@@ -76,14 +64,14 @@ def find_duplicates(
     cancel_fn: Callable | None = None,
 ) -> list[list[Path]]:
     files = collect_files(music_dir, skip_dirs, extensions)
-    cache = {} if no_cache else load_cache(cache_path)
+    cache = {} if no_cache else load_json(cache_path)
     if progress_cb and cache:
         progress_cb(0, len(files), f"Loaded {len(cache)} cached fingerprints")
     entries: list[tuple[Path, float, list]] = []
 
     for i, path in enumerate(files):
         if cancel_fn and cancel_fn():
-            save_cache(cache_path, cache)
+            save_json(cache_path, cache)
             return []
         if progress_cb:
             progress_cb(i, len(files), f"Fingerprinting: {path.name[:50]}")
@@ -100,7 +88,7 @@ def find_duplicates(
             cache[key] = {"mtime": mtime, "duration": duration, "fingerprint": fp}
             entries.append((path, duration, fp))
 
-    save_cache(cache_path, cache)
+    save_json(cache_path, cache)
 
     if cancel_fn and cancel_fn():
         return []

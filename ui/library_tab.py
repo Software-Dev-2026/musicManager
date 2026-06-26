@@ -1,6 +1,4 @@
-import json
 import shutil
-import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -25,51 +23,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.config import Config, LIBRARY_STRUCTURES
+from ..core.cache import flush_meta_cache, get_cached_meta, set_cached_meta
+from ..core.config import LIBRARY_STRUCTURES, Config
 from ..core.metadata import (
-    clean_file_tags, read_tags, write_tags,
-    read_quick_meta, compute_dest_dir, sanitize_name,
+    clean_file_tags,
+    compute_dest_dir,
+    read_quick_meta,
+    read_tags,
+    sanitize_name,
+    write_tags,
 )
 from ..workers.metadata_worker import NormalizeWorker, OrganizeWorker
 from .styles import COLORS, make_vdivider
 
-from ..core.config import _CACHE_DIR
-_CACHE_PATH = _CACHE_DIR / "library_cache.json"
-_scan_cache: dict | None = None  # in-process shared cache across all LibraryTree instances
-
-
-def _load_disk_cache() -> dict | None:
-    try:
-        return json.loads(_CACHE_PATH.read_text())
-    except Exception:
-        return None
-
-
-def _save_disk_cache(cache: dict):
-    try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(json.dumps(cache))
-    except Exception:
-        pass
-
-
-def _cache_is_fresh(cache: dict, config) -> bool:
-    """Return True if the cache matches the current config and the library hasn't changed on disk."""
-    if (cache.get("music_dir") != str(config.music_dir)
-            or cache.get("structure") != config.library_structure
-            or cache.get("show_titles") != config.show_titles):
-        return False
-    scan_time = cache.get("scan_time", 0)
-    try:
-        music_dir = config.music_dir
-        if music_dir.stat().st_mtime > scan_time:
-            return False
-        for d in music_dir.iterdir():
-            if d.is_dir() and d.stat().st_mtime > scan_time:
-                return False
-    except Exception:
-        return False
-    return True
 
 
 class _ScanThread(QThread):
@@ -86,7 +52,11 @@ class _ScanThread(QThread):
 
     def _meta(self, path: Path) -> tuple[str, str, bool]:
         if self.show_titles:
+            hit = get_cached_meta(path)
+            if hit is not None:
+                return hit
             title, artist, _, missing = read_quick_meta(path)
+            set_cached_meta(path, title, artist, missing)
             return title, artist, missing
         return path.stem, "", False
 
@@ -107,6 +77,7 @@ class _ScanThread(QThread):
                     title, artist, missing = self._meta(item)
                     tracks.append((title, str(item), missing))
             results.append(("All Tracks", [], tracks))
+            flush_meta_cache()
             self.done.emit(results)
             return
 
@@ -160,6 +131,7 @@ class _ScanThread(QThread):
             else:
                 results.append(("Misc", [], misc))
 
+        flush_meta_cache()
         self.done.emit(results)
 
 
@@ -184,7 +156,6 @@ class LibraryTree(QTreeWidget):
         self._thread: _ScanThread | None = None
 
     def refresh(self):
-        global _scan_cache
         if self._thread is not None:
             self._thread._cancelled = True
             try:
@@ -192,12 +163,6 @@ class LibraryTree(QTreeWidget):
             except (TypeError, RuntimeError):
                 pass
             self._thread = None
-
-        if _scan_cache is None:
-            _scan_cache = _load_disk_cache()
-        if _scan_cache and _cache_is_fresh(_scan_cache, self.config):
-            self._populate(_scan_cache["results"])
-            return
 
         self.clear()
         thread = _ScanThread(
@@ -212,16 +177,6 @@ class LibraryTree(QTreeWidget):
         self._thread = thread
 
     def _populate(self, results: list):
-        global _scan_cache
-        _scan_cache = {
-            "music_dir": str(self.config.music_dir),
-            "structure": self.config.library_structure,
-            "show_titles": self.config.show_titles,
-            "scan_time": time.time(),
-            "results": results,
-        }
-        _save_disk_cache(_scan_cache)
-
         self.clear()
         structure = self.config.library_structure
         warn_brush = QBrush(QColor(COLORS["warning"]))
@@ -609,12 +564,15 @@ class LibraryTab(QWidget):
             path = path.parent
 
     def _dest_path(self, current: Path, tags: dict) -> Path:
-        return compute_dest_dir(
-            self.config.music_dir,
-            self.config.library_structure,
-            tags.get("artist", ""),
-            tags.get("album", ""),
-        ) / current.name
+        return (
+            compute_dest_dir(
+                self.config.music_dir,
+                self.config.library_structure,
+                tags.get("artist", ""),
+                tags.get("album", ""),
+            )
+            / current.name
+        )
 
     def _save(self):
         if not self._current_file:
@@ -699,7 +657,8 @@ class LibraryTab(QWidget):
         if self._is_batch_running():
             return
         reply = QMessageBox.question(
-            self, "Organize Files by Tags",
+            self,
+            "Organize Files by Tags",
             "This will move files into folders based on their artist and album tags.\n"
             "Files with no artist tag will be moved to an Unknown folder.\n\n"
             "Continue?",
@@ -741,9 +700,7 @@ class LibraryTab(QWidget):
     def _on_organize_done(self, result: dict):
         self._finish_batch()
         errors = result.get("errors", [])
-        self._batch_log.append(
-            f"\nDone. Moved: {result['moved']}  Skipped: {result['skipped']}  Errors: {len(errors)}"
-        )
+        self._batch_log.append(f"\nDone. Moved: {result['moved']}  Skipped: {result['skipped']}  Errors: {len(errors)}")
         for e in errors:
             self._batch_log.append(f"  {e}")
         self._tree.refresh()
