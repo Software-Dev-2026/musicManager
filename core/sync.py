@@ -185,7 +185,6 @@ def apply_folder_sync(
         if e.status in (FileStatus.NEW, FileStatus.CHANGED) or (delete and e.status == FileStatus.DELETED)
     ]
     to_act = _order_for_apply(to_act)
-    stats["deleted"].append(to_act)
     for i, entry in enumerate(to_act):
         if cancel_fn and cancel_fn():
             return stats

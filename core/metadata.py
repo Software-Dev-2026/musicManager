@@ -50,19 +50,6 @@ def compute_dest_dir(music_dir: Path, structure: str, artist: str, album: str) -
     return music_dir / s_artist
 
 
-_TXXX_BLOCKLIST = {
-    "ARTIST",
-    "ARTISTS",
-    "ARTIST NAME",
-    "ALBUMARTIST",
-    "ALBUM_ARTIST",
-    "ALBUM ARTIST",
-    "TITLE",
-    "TRACK TITLE",
-    "ALBUM",
-    "ALBUM TITLE",
-    "COMPILATION",
-}
 
 _VORBIS_RENAMES = {
     "ALBUM ARTIST": "ALBUMARTIST",
@@ -86,7 +73,7 @@ TAG_FIELDS = [
 ]
 
 
-def _strip_embedded_id3(filepath: str):
+def _strip_embedded_id3(filepath: str) -> bool:
     with open(filepath, "rb") as f:
         data = f.read()
     if data[:3] == b"ID3":
@@ -115,32 +102,42 @@ def _strip_embedded_id3(filepath: str):
         with open(filepath, "wb") as f:
             for chunk in chunks:
                 f.write(chunk)
+    return found
 
 
-def clean_file_tags(filepath: str):
+def clean_file_tags(filepath: str) -> bool:
     ext = filepath.lower().rsplit(".", 1)[-1]
     if ext == "mp3":
-        _strip_embedded_id3(filepath)
+        dirty = _strip_embedded_id3(filepath)
         try:
             tags = ID3(filepath)
         except ID3NoHeaderError:
-            return
-        tags.update_to_v23()
+            return dirty
+        if tags.version[:2] != (2, 3):
+            tags.update_to_v23()
+            dirty = True
         for key in list(tags.keys()):
-            if key.startswith("TXXX:") and key[5:].upper() in _TXXX_BLOCKLIST:
+            if key.startswith("TXXX:"):
                 del tags[key]
-        tags.save(filepath, v2_version=3, v1=0)
+                dirty = True
         try:
+            mutagen.apev2.APEv2(filepath)
             mutagen.apev2.delete(filepath)
+            dirty = True
+        except mutagen.apev2.APENoHeaderError:
+            pass
         except Exception:
             pass
+        if dirty:
+            tags.save(filepath, v2_version=3, v1=0)
+        return dirty
     elif ext in ("flac", "ogg", "opus"):
         try:
             f = mutagen.File(filepath)
         except Exception:
-            return
+            return False
         if f is None or f.tags is None:
-            return
+            return False
         dirty = False
         for old, new in _VORBIS_RENAMES.items():
             if old in f.tags:
@@ -150,6 +147,8 @@ def clean_file_tags(filepath: str):
                 dirty = True
         if dirty:
             f.save()
+        return dirty
+    return False
 
 
 def read_tags(filepath: str) -> dict[str, Any]:
@@ -245,9 +244,13 @@ def normalize_file(filepath: str, artist: str, album: str | None) -> bool:
     if bool(f["compilation"]):
         f["compilation"] = 0
         changed = True
+    original_mtime = Path(filepath).stat().st_mtime
     if changed:
         f.save()
-    clean_file_tags(filepath)
+    changed |= clean_file_tags(filepath)
+    if not changed:
+        stat = Path(filepath).stat()
+        os.utime(filepath, (stat.st_atime, original_mtime))
     return changed
 
 
