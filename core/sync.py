@@ -358,12 +358,15 @@ class SMBSyncer:
             raise RuntimeError("pysmb not installed — pip install pysmb")
         remote_name = self.host.split(".")[0]
         for port, direct in ((445, True), (139, False)):
-            conn = SMBConnection(
-                self.user, self.password, socket.gethostname(), remote_name,
-                use_ntlm_v2=True, is_direct_tcp=direct,
-            )
-            if conn.connect(self.host, port):
-                return conn
+            try:
+                conn = SMBConnection(
+                    self.user, self.password, socket.gethostname(), remote_name,
+                    use_ntlm_v2=True, is_direct_tcp=direct,
+                )
+                if conn.connect(self.host, port):
+                    return conn
+            except Exception:
+                pass
         return None
 
     def connect(self) -> bool:
@@ -485,13 +488,14 @@ class SMBSyncer:
                     )
         return diff
 
-    def _build_remote_path(self, components: list[str], remote_root: str) -> None:
+    def _build_remote_path(self, components: list[str], remote_root: str, conn=None) -> None:
         """Create each directory component under remote_root, renaming wrong-case entries first."""
+        conn = conn or self._conn
         current = remote_root
         for part in components:
             expected = posixpath.join(current, part)
             try:
-                for e in self._conn.listPath(self.share, current):
+                for e in conn.listPath(self.share, current):
                     if (
                         e.filename not in (".", "..")
                         and e.isDirectory
@@ -499,28 +503,28 @@ class SMBSyncer:
                         and e.filename.lower() == part.lower()
                     ):
                         try:
-                            self._conn.rename(self.share, posixpath.join(current, e.filename), expected)
+                            conn.rename(self.share, posixpath.join(current, e.filename), expected)
                         except Exception:
                             pass
                         break
             except Exception:
                 pass
             try:
-                self._conn.listPath(self.share, expected)
+                conn.listPath(self.share, expected)
             except Exception:
                 try:
-                    self._conn.createDirectory(self.share, expected)
+                    conn.createDirectory(self.share, expected)
                 except Exception:
                     pass
             current = expected
 
-    def _ensure_remote_dir(self, rel_dir: str, remote_root: str) -> None:
+    def _ensure_remote_dir(self, rel_dir: str, remote_root: str, conn=None) -> None:
         parts = rel_dir.replace("\\", "/").split("/")
-        self._build_remote_path(parts, remote_root)
+        self._build_remote_path(parts, remote_root, conn=conn)
 
-    def _ensure_remote_file_dirs(self, rel_path: str, remote_root: str) -> None:
+    def _ensure_remote_file_dirs(self, rel_path: str, remote_root: str, conn=None) -> None:
         parts = rel_path.replace("\\", "/").split("/")[:-1]
-        self._build_remote_path(parts, remote_root)
+        self._build_remote_path(parts, remote_root, conn=conn)
 
     def _remove_empty_remote_parents(self, rpath: str, remote_root: str) -> None:
         root = remote_root.rstrip("/")
@@ -557,25 +561,52 @@ class SMBSyncer:
         transfers = [e for e in to_act if not e.is_dir and e.status in (FileStatus.NEW, FileStatus.CHANGED)]
         deletions = [e for e in to_act if not e.is_dir and e.status == FileStatus.DELETED]
 
-        # Create dirs sequentially — avoids race conditions and is fast
+        # Create explicit new dirs sequentially on main connection
         for entry in new_dirs:
             if cancel_fn and cancel_fn():
                 return stats
             self._ensure_remote_dir(entry.rel_path, remote_root)
 
-        # Pre-create all parent dirs for file transfers before going parallel
-        needed = sorted({posixpath.dirname(e.rel_path) for e in transfers if "/" in e.rel_path})
-        for rel_dir in needed:
-            self._ensure_remote_dir(rel_dir, remote_root)
-
         total = len(transfers) + len(deletions)
         done = 0
 
+        _conn_lock = threading.Lock()
+
+        def _upload_via(conn, rpath, local_path):
+            # Thread-unique temp name so parallel uploads of case-equivalent paths
+            # (same name on a case-insensitive server) don't share a temp file.
+            rtmp = rpath + f".{threading.get_ident()}.synctmp"
+            uploaded = False
+            try:
+                with open(local_path, "rb", buffering=_IO_BUFFER) as fh:
+                    conn.storeFile(self.share, rtmp, fh)
+                uploaded = True
+                try:
+                    conn.deleteFiles(self.share, rpath)
+                except Exception:
+                    pass
+                conn.rename(self.share, rtmp, rpath)
+            except Exception:
+                if uploaded:
+                    try:
+                        conn.deleteFiles(self.share, rtmp)
+                    except Exception:
+                        pass
+                raise
+
         def _do_upload(entry):
-            rpath = posixpath.join(remote_root.rstrip("/"), entry.rel_path)
-            with self._pooled_conn() as conn:
-                with open(local_root / entry.rel_path, "rb", buffering=_IO_BUFFER) as fh:
-                    conn.storeFile(self.share, rpath, fh)
+            rpath = posixpath.join(remote_root.rstrip("/") or "/", entry.rel_path)
+            local_path = local_root / entry.rel_path
+            try:
+                with self._pooled_conn() as conn:
+                    self._ensure_remote_file_dirs(entry.rel_path, remote_root, conn=conn)
+                    _upload_via(conn, rpath, local_path)
+            except Exception:
+                # Fallback: main connection serialised — avoids concurrent open of
+                # case-equivalent paths on a case-insensitive server
+                with _conn_lock:
+                    self._ensure_remote_file_dirs(entry.rel_path, remote_root)
+                    _upload_via(self._conn, rpath, local_path)
 
         with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
             future_map = {}
@@ -592,7 +623,8 @@ class SMBSyncer:
                     fut.result()
                     stats["transferred"] += 1
                 except Exception as e:
-                    stats["errors"].append(f"{entry.rel_path}: {e}")
+                    import traceback
+                    stats["errors"].append(f"{entry.rel_path}: {traceback.format_exc()}")
 
         for entry in deletions:
             if cancel_fn and cancel_fn():
