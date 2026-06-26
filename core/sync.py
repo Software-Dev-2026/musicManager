@@ -1,10 +1,17 @@
 import posixpath
 import shutil
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+
+
+_IO_BUFFER = 4 * 1024 * 1024   # 4 MB read/write buffer per transfer
+_WORKERS   = 4                  # concurrent transfer threads
 
 
 class FileStatus(Enum):
@@ -111,6 +118,21 @@ def _ensure_case_correct_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _copy_file(src: Path, dst: Path) -> None:
+    """Copy src → dst with a 4 MB buffer, writing through a temp file for atomicity."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".synctmp")
+    try:
+        with open(src, "rb", buffering=_IO_BUFFER) as f_in, \
+             open(tmp, "wb", buffering=_IO_BUFFER) as f_out:
+            shutil.copyfileobj(f_in, f_out, length=_IO_BUFFER)
+        shutil.copystat(str(src), str(tmp))
+        tmp.replace(dst)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 # ── Folder sync ───────────────────────────────────────────────────────────────
 
 
@@ -177,45 +199,68 @@ def apply_folder_sync(
     progress_cb: Callable | None = None,
     cancel_fn: Callable | None = None,
 ) -> dict:
-    """Push: copy NEW/CHANGED from src → dst; optionally delete DELETED from dst."""
+    """Push: copy NEW/CHANGED from src → dst in parallel; optionally delete DELETED."""
     stats = {"transferred": 0, "deleted": 0, "errors": []}
     to_act = [
-        e
-        for e in diff.entries
+        e for e in diff.entries
         if e.status in (FileStatus.NEW, FileStatus.CHANGED) or (delete and e.status == FileStatus.DELETED)
     ]
     to_act = _order_for_apply(to_act)
-    for i, entry in enumerate(to_act):
+
+    new_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.NEW]
+    del_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.DELETED]
+    transfers = [e for e in to_act if not e.is_dir and e.status in (FileStatus.NEW, FileStatus.CHANGED)]
+    deletions = [e for e in to_act if not e.is_dir and e.status == FileStatus.DELETED]
+
+    # Dirs first — sequential, fast, order matters for nested paths
+    for entry in new_dirs:
         if cancel_fn and cancel_fn():
             return stats
-        if progress_cb:
-            progress_cb(i, len(to_act), entry.rel_path)
-        dst_path = dst / entry.rel_path
-        if entry.is_dir:
-            if entry.status == FileStatus.NEW:
-                try:
-                    _ensure_case_correct_dir(dst_path)
-                except Exception as e:
-                    stats["errors"].append(f"{entry.rel_path}: {e}")
-            else:  # DELETED
-                try:
-                    shutil.rmtree(dst_path)
-                except OSError:
-                    pass
-            continue
-        if entry.status in (FileStatus.NEW, FileStatus.CHANGED):
+        try:
+            _ensure_case_correct_dir(dst / entry.rel_path)
+        except Exception as e:
+            stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    total = len(transfers) + len(deletions)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+        future_map = {}
+        for entry in transfers:
+            if cancel_fn and cancel_fn():
+                break
+            future_map[pool.submit(_copy_file, src / entry.rel_path, dst / entry.rel_path)] = entry
+        for fut in as_completed(future_map):
+            entry = future_map[fut]
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, entry.rel_path)
             try:
-                _ensure_case_correct_dir(dst_path.parent)
-                shutil.copy2(str(src / entry.rel_path), str(dst_path))
+                fut.result()
                 stats["transferred"] += 1
             except Exception as e:
                 stats["errors"].append(f"{entry.rel_path}: {e}")
-        else:  # DELETED
-            try:
-                dst_path.unlink(missing_ok=True)
-                stats["deleted"] += 1
-            except Exception as e:
-                stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    for entry in deletions:
+        if cancel_fn and cancel_fn():
+            return stats
+        done += 1
+        if progress_cb:
+            progress_cb(done, total, entry.rel_path)
+        try:
+            (dst / entry.rel_path).unlink(missing_ok=True)
+            stats["deleted"] += 1
+        except Exception as e:
+            stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    for entry in del_dirs:
+        if cancel_fn and cancel_fn():
+            return stats
+        try:
+            shutil.rmtree(dst / entry.rel_path)
+        except OSError:
+            pass
+
     return stats
 
 
@@ -227,46 +272,69 @@ def apply_folder_pull(
     progress_cb: Callable | None = None,
     cancel_fn: Callable | None = None,
 ) -> dict:
-    """Pull: copy DELETED/CHANGED from remote → local; optionally delete NEW (local-only) files."""
+    """Pull: copy CHANGED/DELETED from remote → local in parallel; optionally delete NEW."""
     stats = {"transferred": 0, "deleted": 0, "errors": []}
     to_act = [
-        e
-        for e in diff.entries
+        e for e in diff.entries
         if e.status in (FileStatus.CHANGED, FileStatus.DELETED) or (delete and e.status == FileStatus.NEW)
     ]
     to_act = _order_for_apply(to_act)
-    for i, entry in enumerate(to_act):
+
+    # DELETED dirs: exist on remote, not local → create locally
+    # NEW dirs: local-only, delete if delete=True
+    new_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.DELETED]
+    del_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.NEW]
+    transfers = [e for e in to_act if not e.is_dir and e.status in (FileStatus.CHANGED, FileStatus.DELETED)]
+    deletions = [e for e in to_act if not e.is_dir and e.status == FileStatus.NEW]
+
+    for entry in new_dirs:
         if cancel_fn and cancel_fn():
             return stats
-        if progress_cb:
-            progress_cb(i, len(to_act), entry.rel_path)
-        local_path = local / entry.rel_path
-        if entry.is_dir:
-            if entry.status == FileStatus.DELETED:  # exists remote, not local → create locally
-                try:
-                    _ensure_case_correct_dir(local_path)
-                except Exception as e:
-                    stats["errors"].append(f"{entry.rel_path}: {e}")
-            else:  # NEW with delete: local-only dir
-                try:
-                    # local_path.rmdir()
-                    shutil.rmtree(local_path)
-                except OSError:
-                    pass
-            continue
-        if entry.status in (FileStatus.CHANGED, FileStatus.DELETED):
+        try:
+            _ensure_case_correct_dir(local / entry.rel_path)
+        except Exception as e:
+            stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    total = len(transfers) + len(deletions)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+        future_map = {}
+        for entry in transfers:
+            if cancel_fn and cancel_fn():
+                break
+            future_map[pool.submit(_copy_file, remote / entry.rel_path, local / entry.rel_path)] = entry
+        for fut in as_completed(future_map):
+            entry = future_map[fut]
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, entry.rel_path)
             try:
-                _ensure_case_correct_dir(local_path.parent)
-                shutil.copy2(str(remote / entry.rel_path), str(local_path))
+                fut.result()
                 stats["transferred"] += 1
             except Exception as e:
                 stats["errors"].append(f"{entry.rel_path}: {e}")
-        else:  # NEW with delete: local-only file
-            try:
-                local_path.unlink(missing_ok=True)
-                stats["deleted"] += 1
-            except Exception as e:
-                stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    for entry in deletions:
+        if cancel_fn and cancel_fn():
+            return stats
+        done += 1
+        if progress_cb:
+            progress_cb(done, total, entry.rel_path)
+        try:
+            (local / entry.rel_path).unlink(missing_ok=True)
+            stats["deleted"] += 1
+        except Exception as e:
+            stats["errors"].append(f"{entry.rel_path}: {e}")
+
+    for entry in del_dirs:
+        if cancel_fn and cancel_fn():
+            return stats
+        try:
+            shutil.rmtree(local / entry.rel_path)
+        except OSError:
+            pass
+
     return stats
 
 
@@ -280,8 +348,10 @@ class SMBSyncer:
         self.user = user
         self.password = password
         self._conn = None
+        self._pool: list = []
+        self._pool_lock = threading.Lock()
 
-    def connect(self) -> bool:
+    def _make_conn(self):
         try:
             from smb.SMBConnection import SMBConnection
         except ImportError:
@@ -289,25 +359,51 @@ class SMBSyncer:
         remote_name = self.host.split(".")[0]
         for port, direct in ((445, True), (139, False)):
             conn = SMBConnection(
-                self.user,
-                self.password,
-                socket.gethostname(),
-                remote_name,
-                use_ntlm_v2=True,
-                is_direct_tcp=direct,
+                self.user, self.password, socket.gethostname(), remote_name,
+                use_ntlm_v2=True, is_direct_tcp=direct,
             )
             if conn.connect(self.host, port):
-                self._conn = conn
-                return True
+                return conn
+        return None
+
+    def connect(self) -> bool:
+        conn = self._make_conn()
+        if conn:
+            self._conn = conn
+            return True
         return False
 
     def disconnect(self):
-        if self._conn:
+        conns = [self._conn] if self._conn else []
+        self._conn = None
+        with self._pool_lock:
+            conns.extend(self._pool)
+            self._pool.clear()
+        for conn in conns:
             try:
-                self._conn.close()
+                conn.close()
             except Exception:
                 pass
-            self._conn = None
+
+    @contextmanager
+    def _pooled_conn(self):
+        with self._pool_lock:
+            conn = self._pool.pop() if self._pool else None
+        if conn is None:
+            conn = self._make_conn()
+        if conn is None:
+            raise RuntimeError(f"Could not connect to {self.host}")
+        try:
+            yield conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        else:
+            with self._pool_lock:
+                self._pool.append(conn)
 
     def _list_remote(self, path: str) -> dict:
         try:
@@ -334,7 +430,7 @@ class SMBSyncer:
         rpath = rpath.lstrip("/")
         prefix = remote_root.strip("/")
         if prefix and rpath.startswith(prefix + "/"):
-            rpath = rpath[len(prefix) + 1 :]
+            rpath = rpath[len(prefix) + 1:]
         return rpath
 
     def compute_diff(
@@ -403,11 +499,7 @@ class SMBSyncer:
                         and e.filename.lower() == part.lower()
                     ):
                         try:
-                            self._conn.rename(
-                                self.share,
-                                posixpath.join(current, e.filename),
-                                expected,
-                            )
+                            self._conn.rename(self.share, posixpath.join(current, e.filename), expected)
                         except Exception:
                             pass
                         break
@@ -422,14 +514,12 @@ class SMBSyncer:
                     pass
             current = expected
 
-    def _ensure_remote_file_dirs(self, rel_path: str, remote_root: str) -> None:
-        """Ensure all parent directories of a file path exist on the remote."""
-        parts = rel_path.replace("\\", "/").split("/")[:-1]
+    def _ensure_remote_dir(self, rel_dir: str, remote_root: str) -> None:
+        parts = rel_dir.replace("\\", "/").split("/")
         self._build_remote_path(parts, remote_root)
 
-    def _ensure_remote_dir(self, rel_dir: str, remote_root: str) -> None:
-        """Ensure a directory (and all its parents) exists on the remote."""
-        parts = rel_dir.replace("\\", "/").split("/")
+    def _ensure_remote_file_dirs(self, rel_path: str, remote_root: str) -> None:
+        parts = rel_path.replace("\\", "/").split("/")[:-1]
         self._build_remote_path(parts, remote_root)
 
     def _remove_empty_remote_parents(self, rpath: str, remote_root: str) -> None:
@@ -454,45 +544,79 @@ class SMBSyncer:
         progress_cb: Callable | None = None,
         cancel_fn: Callable | None = None,
     ) -> dict:
-        """Push: upload NEW/CHANGED to remote; optionally delete DELETED from remote."""
+        """Push: upload NEW/CHANGED in parallel; optionally delete DELETED from remote."""
         stats = {"transferred": 0, "deleted": 0, "errors": []}
         to_act = [
-            e
-            for e in diff.entries
+            e for e in diff.entries
             if e.status in (FileStatus.NEW, FileStatus.CHANGED) or (delete and e.status == FileStatus.DELETED)
         ]
         to_act = _order_for_apply(to_act)
 
-        for i, entry in enumerate(to_act):
+        new_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.NEW]
+        del_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.DELETED]
+        transfers = [e for e in to_act if not e.is_dir and e.status in (FileStatus.NEW, FileStatus.CHANGED)]
+        deletions = [e for e in to_act if not e.is_dir and e.status == FileStatus.DELETED]
+
+        # Create dirs sequentially — avoids race conditions and is fast
+        for entry in new_dirs:
             if cancel_fn and cancel_fn():
                 return stats
-            if progress_cb:
-                progress_cb(i, len(to_act), entry.rel_path)
+            self._ensure_remote_dir(entry.rel_path, remote_root)
+
+        # Pre-create all parent dirs for file transfers before going parallel
+        needed = sorted({posixpath.dirname(e.rel_path) for e in transfers if "/" in e.rel_path})
+        for rel_dir in needed:
+            self._ensure_remote_dir(rel_dir, remote_root)
+
+        total = len(transfers) + len(deletions)
+        done = 0
+
+        def _do_upload(entry):
             rpath = posixpath.join(remote_root.rstrip("/"), entry.rel_path)
-            if entry.is_dir:
-                if entry.status == FileStatus.NEW:
-                    self._ensure_remote_dir(entry.rel_path, remote_root)
-                else:  # DELETED — non-empty dirs cleaned up by _remove_empty_remote_parents
-                    try:
-                        self._conn.deleteDirectory(self.share, rpath)
-                    except Exception:
-                        pass
-                continue
-            if entry.status in (FileStatus.NEW, FileStatus.CHANGED):
-                self._ensure_remote_file_dirs(entry.rel_path, remote_root)
+            with self._pooled_conn() as conn:
+                with open(local_root / entry.rel_path, "rb", buffering=_IO_BUFFER) as fh:
+                    conn.storeFile(self.share, rpath, fh)
+
+        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+            future_map = {}
+            for entry in transfers:
+                if cancel_fn and cancel_fn():
+                    break
+                future_map[pool.submit(_do_upload, entry)] = entry
+            for fut in as_completed(future_map):
+                entry = future_map[fut]
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, entry.rel_path)
                 try:
-                    with open(local_root / entry.rel_path, "rb") as fh:
-                        self._conn.storeFile(self.share, rpath, fh)
+                    fut.result()
                     stats["transferred"] += 1
                 except Exception as e:
                     stats["errors"].append(f"{entry.rel_path}: {e}")
-            else:  # DELETED
-                try:
-                    self._conn.deleteFiles(self.share, rpath)
-                    self._remove_empty_remote_parents(rpath, remote_root)
-                    stats["deleted"] += 1
-                except Exception as e:
-                    stats["errors"].append(f"{entry.rel_path}: {e}")
+
+        for entry in deletions:
+            if cancel_fn and cancel_fn():
+                return stats
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, entry.rel_path)
+            rpath = posixpath.join(remote_root.rstrip("/"), entry.rel_path)
+            try:
+                self._conn.deleteFiles(self.share, rpath)
+                self._remove_empty_remote_parents(rpath, remote_root)
+                stats["deleted"] += 1
+            except Exception as e:
+                stats["errors"].append(f"{entry.rel_path}: {e}")
+
+        for entry in del_dirs:
+            if cancel_fn and cancel_fn():
+                return stats
+            rpath = posixpath.join(remote_root.rstrip("/"), entry.rel_path)
+            try:
+                self._conn.deleteDirectory(self.share, rpath)
+            except Exception:
+                pass
+
         return stats
 
     def apply_pull(
@@ -504,49 +628,79 @@ class SMBSyncer:
         progress_cb: Callable | None = None,
         cancel_fn: Callable | None = None,
     ) -> dict:
-        """Pull: download DELETED/CHANGED from remote → local; optionally delete NEW (local-only)."""
+        """Pull: download CHANGED/DELETED in parallel; optionally delete NEW (local-only)."""
         stats = {"transferred": 0, "deleted": 0, "errors": []}
         to_act = [
-            e
-            for e in diff.entries
+            e for e in diff.entries
             if e.status in (FileStatus.CHANGED, FileStatus.DELETED) or (delete and e.status == FileStatus.NEW)
         ]
-
         to_act = _order_for_apply(to_act)
 
-        for i, entry in enumerate(to_act):
+        new_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.DELETED]
+        del_dirs  = [e for e in to_act if e.is_dir and e.status == FileStatus.NEW]
+        transfers = [e for e in to_act if not e.is_dir and e.status in (FileStatus.CHANGED, FileStatus.DELETED)]
+        deletions = [e for e in to_act if not e.is_dir and e.status == FileStatus.NEW]
+
+        for entry in new_dirs:
             if cancel_fn and cancel_fn():
                 return stats
-            if progress_cb:
-                progress_cb(i, len(to_act), entry.rel_path)
+            try:
+                _ensure_case_correct_dir(local_root / entry.rel_path)
+            except Exception as e:
+                stats["errors"].append(f"{entry.rel_path}: {e}")
+
+        total = len(transfers) + len(deletions)
+        done = 0
+
+        def _do_download(entry):
             rpath = posixpath.join(remote_root.rstrip("/"), entry.rel_path)
             local_path = local_root / entry.rel_path
-            if entry.is_dir:
-                if entry.status == FileStatus.DELETED:  # exists remote, not local → create locally
-                    try:
-                        _ensure_case_correct_dir(local_path)
-                    except Exception as e:
-                        stats["errors"].append(f"{entry.rel_path}: {e}")
-                else:  # NEW with delete: local-only dir
-                    try:
-                        # local_path.rmdir()
-                        shutil.rmtree(local_path)
-                    except OSError:
-                        pass
-                continue
-            if entry.status in (FileStatus.CHANGED, FileStatus.DELETED):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = local_path.with_name(local_path.name + ".synctmp")
+            try:
+                with self._pooled_conn() as conn:
+                    with open(tmp, "wb", buffering=_IO_BUFFER) as fh:
+                        conn.retrieveFile(self.share, rpath, fh)
+                tmp.replace(local_path)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+
+        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+            future_map = {}
+            for entry in transfers:
+                if cancel_fn and cancel_fn():
+                    break
+                future_map[pool.submit(_do_download, entry)] = entry
+            for fut in as_completed(future_map):
+                entry = future_map[fut]
+                done += 1
+                if progress_cb:
+                    progress_cb(done, total, entry.rel_path)
                 try:
-                    _ensure_case_correct_dir(local_path.parent)
-                    with open(local_path, "wb") as fh:
-                        self._conn.retrieveFile(self.share, rpath, fh)
+                    fut.result()
                     stats["transferred"] += 1
                 except Exception as e:
                     stats["errors"].append(f"{entry.rel_path}: {e}")
-            else:  # NEW with delete: local-only file
-                try:
-                    local_path.unlink(missing_ok=True)
-                    _remove_empty_parents(local_path, local_root)
-                    stats["deleted"] += 1
-                except Exception as e:
-                    stats["errors"].append(f"{entry.rel_path}: {e}")
+
+        for entry in deletions:
+            if cancel_fn and cancel_fn():
+                return stats
+            done += 1
+            if progress_cb:
+                progress_cb(done, total, entry.rel_path)
+            try:
+                (local_root / entry.rel_path).unlink(missing_ok=True)
+                stats["deleted"] += 1
+            except Exception as e:
+                stats["errors"].append(f"{entry.rel_path}: {e}")
+
+        for entry in del_dirs:
+            if cancel_fn and cancel_fn():
+                return stats
+            try:
+                shutil.rmtree(local_root / entry.rel_path)
+            except OSError:
+                pass
+
         return stats

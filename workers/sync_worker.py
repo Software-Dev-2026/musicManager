@@ -57,7 +57,8 @@ class DiffWorker(BaseWorker):
                     return
                 self.finished.emit({"diff": diff, "syncer": syncer})
         except Exception as e:
-            self.error.emit(str(e))
+            import traceback
+            self.error.emit(traceback.format_exc())
 
 
 class SyncApplyWorker(BaseWorker):
@@ -110,4 +111,5 @@ class SyncApplyWorker(BaseWorker):
                 return
             self.finished.emit(stats)
         except Exception as e:
-            self.error.emit(str(e))
+            import traceback
+            self.error.emit(traceback.format_exc())
