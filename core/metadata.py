@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 from pathlib import Path
@@ -9,6 +10,7 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 
 try:
     import music_tag
+
     HAS_MUSIC_TAG = True
 except ImportError:
     HAS_MUSIC_TAG = False
@@ -49,23 +51,39 @@ def compute_dest_dir(music_dir: Path, structure: str, artist: str, album: str) -
 
 
 _TXXX_BLOCKLIST = {
-    "ARTIST", "ARTISTS", "ARTIST NAME",
-    "ALBUMARTIST", "ALBUM_ARTIST", "ALBUM ARTIST",
-    "TITLE", "TRACK TITLE",
-    "ALBUM", "ALBUM TITLE",
+    "ARTIST",
+    "ARTISTS",
+    "ARTIST NAME",
+    "ALBUMARTIST",
+    "ALBUM_ARTIST",
+    "ALBUM ARTIST",
+    "TITLE",
+    "TRACK TITLE",
+    "ALBUM",
+    "ALBUM TITLE",
     "COMPILATION",
 }
 
 _VORBIS_RENAMES = {
     "ALBUM ARTIST": "ALBUMARTIST",
     "ALBUM_ARTIST": "ALBUMARTIST",
-    "TRACK TITLE":  "TITLE",
-    "ARTIST NAME":  "ARTIST",
-    "ALBUM TITLE":  "ALBUM",
+    "TRACK TITLE": "TITLE",
+    "ARTIST NAME": "ARTIST",
+    "ALBUM TITLE": "ALBUM",
 }
 
-TAG_FIELDS = ["title", "artist", "albumartist", "album", "tracknumber", "discnumber",
-              "year", "genre", "comment", "compilation"]
+TAG_FIELDS = [
+    "title",
+    "artist",
+    "albumartist",
+    "album",
+    "tracknumber",
+    "discnumber",
+    "year",
+    "genre",
+    "comment",
+    "compilation",
+]
 
 
 def _strip_embedded_id3(filepath: str):
@@ -87,7 +105,7 @@ def _strip_embedded_id3(filepath: str):
             chunks.append(data[pos:])
             break
         if idx + 10 <= len(data) and data[idx + 3] in (2, 3, 4):
-            block_size = 10 + ((data[idx+6] << 21) | (data[idx+7] << 14) | (data[idx+8] << 7) | data[idx+9])
+            block_size = 10 + ((data[idx + 6] << 21) | (data[idx + 7] << 14) | (data[idx + 8] << 7) | data[idx + 9])
             chunks.append(data[pos:idx])
             found = True
             pos = idx + block_size
@@ -207,6 +225,9 @@ def normalize_file(filepath: str, artist: str, album: str | None) -> bool:
     if str(f["artist"]) != artist:
         f["artist"] = artist
         changed = True
+    if str(f["title"]) == "" or f["title"] is None:
+        f["title"] = os.path.basename(filepath)[:-4]
+        changed = True
     if album is None:
         if str(f["albumartist"]) != "":
             f["albumartist"] = ""
@@ -240,8 +261,9 @@ def collect_audio_files(root: Path, skip_dirs: set, extensions: set) -> list[Pat
     return sorted(files)
 
 
-def batch_normalize(music_dir: Path, skip_dirs: set, extensions: set,
-                    progress_cb=None, cancel_fn=None) -> tuple[int, int]:
+def batch_normalize(
+    music_dir: Path, skip_dirs: set, extensions: set, progress_cb=None, cancel_fn=None
+) -> tuple[int, int]:
     changed = skipped = 0
     artists = sorted(d for d in music_dir.iterdir() if d.is_dir() and d.name not in skip_dirs)
     total = len(artists)
@@ -273,8 +295,9 @@ def _prune_empty_dir(directory: Path, stop_at: Path):
         path = path.parent
 
 
-def batch_organize(music_dir: Path, structure: str, skip_dirs: set, extensions: set,
-                   progress_cb=None, cancel_fn=None) -> tuple[int, int, list]:
+def batch_organize(
+    music_dir: Path, structure: str, skip_dirs: set, extensions: set, progress_cb=None, cancel_fn=None
+) -> tuple[int, int, list]:
     """Move every audio file into the folder dictated by its artist/album tags.
 
     Does not edit tags. Files with no artist tag are moved to an Unknown folder.
