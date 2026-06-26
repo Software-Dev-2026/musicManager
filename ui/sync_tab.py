@@ -194,8 +194,7 @@ class SyncTab(QWidget):
             f"New: {s[FileStatus.NEW]}  |  Changed: {s[FileStatus.CHANGED]}  |  "
             f"Deleted: {s[FileStatus.DELETED]}  |  Unchanged: {s[FileStatus.UNCHANGED]}"
         )
-        has_changes = s[FileStatus.NEW] + s[FileStatus.CHANGED] + s[FileStatus.DELETED] > 0
-        self._sync_btn.setEnabled(has_changes)
+        self._sync_btn.setEnabled(self._diff.has_changes())
 
     def _populate_diff_tree(self, diff: SyncDiff):
         self._diff_tree.clear()
@@ -228,6 +227,9 @@ class SyncTab(QWidget):
                 for col in range(4):
                     item.setBackground(col, QColor(bg))
                     item.setForeground(col, QColor(fg))
+            if entry.is_dir:
+                item.setExpanded(True)
+                nodes[entry.rel_path.replace("\\", "/")] = item
 
     def _apply_sync(self):
         if not self._diff:

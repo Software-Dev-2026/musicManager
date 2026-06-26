@@ -18,6 +18,8 @@ class DiffWorker(BaseWorker):
         def progress_cb(current, total, msg):
             self.progress.emit(current, total, msg)
 
+        cancel = lambda: self._cancelled
+
         try:
             if self.mode == "folder":
                 src = self.config.music_dir
@@ -27,7 +29,10 @@ class DiffWorker(BaseWorker):
                     set(self.config.skip_dirs),
                     self.config.audio_extensions,
                     progress_cb,
+                    cancel,
                 )
+                if self._cancelled:
+                    return
                 self.finished.emit({"diff": diff, "syncer": None})
             else:
                 syncer = SMBSyncer(
@@ -45,7 +50,11 @@ class DiffWorker(BaseWorker):
                     self.config.audio_extensions,
                     "/",
                     progress_cb,
+                    cancel,
                 )
+                if self._cancelled:
+                    syncer.disconnect()
+                    return
                 self.finished.emit({"diff": diff, "syncer": syncer})
         except Exception as e:
             self.error.emit(str(e))
@@ -74,27 +83,31 @@ class SyncApplyWorker(BaseWorker):
             self.progress.emit(current, total, msg)
             self.log.emit(f"[sync] {msg}")
 
+        cancel = lambda: self._cancelled
+
         try:
             local = self.config.music_dir
             if self.mode == "folder":
                 remote = Path(self.config.folder_sync_dest)
                 if self.direction == "pull":
-                    stats = apply_folder_pull(self.diff, local, remote, self.delete, progress_cb)
+                    stats = apply_folder_pull(self.diff, local, remote, self.delete, progress_cb, cancel)
                 else:
-                    stats = apply_folder_sync(self.diff, local, remote, self.delete, progress_cb)
+                    stats = apply_folder_sync(self.diff, local, remote, self.delete, progress_cb, cancel)
             else:
                 if not self.syncer:
                     self.error.emit("No SMB connection")
                     return
                 if self.direction == "pull":
                     stats = self.syncer.apply_pull(
-                        self.diff, local, "/", self.delete, progress_cb,
+                        self.diff, local, "/", self.delete, progress_cb, cancel,
                     )
                 else:
                     stats = self.syncer.apply_sync(
-                        self.diff, local, "/", self.delete, progress_cb,
+                        self.diff, local, "/", self.delete, progress_cb, cancel,
                     )
                 self.syncer.disconnect()
+            if self._cancelled:
+                return
             self.finished.emit(stats)
         except Exception as e:
             self.error.emit(str(e))
