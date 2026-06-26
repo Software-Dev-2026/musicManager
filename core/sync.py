@@ -185,6 +185,7 @@ def apply_folder_sync(
         if e.status in (FileStatus.NEW, FileStatus.CHANGED) or (delete and e.status == FileStatus.DELETED)
     ]
     to_act = _order_for_apply(to_act)
+    stats["deleted"].append(to_act)
     for i, entry in enumerate(to_act):
         if cancel_fn and cancel_fn():
             return stats
@@ -199,7 +200,7 @@ def apply_folder_sync(
                     stats["errors"].append(f"{entry.rel_path}: {e}")
             else:  # DELETED
                 try:
-                    dst_path.rmdir()
+                    shutil.rmtree(dst_path)
                 except OSError:
                     pass
             continue
@@ -249,7 +250,8 @@ def apply_folder_pull(
                     stats["errors"].append(f"{entry.rel_path}: {e}")
             else:  # NEW with delete: local-only dir
                 try:
-                    local_path.rmdir()
+                    # local_path.rmdir()
+                    shutil.rmtree(local_path)
                 except OSError:
                     pass
             continue
@@ -460,6 +462,7 @@ class SMBSyncer:
             for e in diff.entries
             if e.status in (FileStatus.NEW, FileStatus.CHANGED) or (delete and e.status == FileStatus.DELETED)
         ]
+        to_act = _order_for_apply(to_act)
 
         for i, entry in enumerate(to_act):
             if cancel_fn and cancel_fn():
@@ -510,6 +513,8 @@ class SMBSyncer:
             if e.status in (FileStatus.CHANGED, FileStatus.DELETED) or (delete and e.status == FileStatus.NEW)
         ]
 
+        to_act = _order_for_apply(to_act)
+
         for i, entry in enumerate(to_act):
             if cancel_fn and cancel_fn():
                 return stats
@@ -525,7 +530,8 @@ class SMBSyncer:
                         stats["errors"].append(f"{entry.rel_path}: {e}")
                 else:  # NEW with delete: local-only dir
                     try:
-                        local_path.rmdir()
+                        # local_path.rmdir()
+                        shutil.rmtree(local_path)
                     except OSError:
                         pass
                 continue
