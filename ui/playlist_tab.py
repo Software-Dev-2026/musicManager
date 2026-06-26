@@ -30,6 +30,7 @@ from ..core.config import Config
 from ..core.downloader import decode_playlist
 from ..core.metadata import read_quick_meta
 from ..workers.base_worker import BaseWorker
+from ..workers.resolve_worker import ResolveWorker
 from .library_tab import LibraryTree
 from .styles import COLORS, make_vdivider
 
@@ -59,6 +60,7 @@ class _TrackInfoWorker(BaseWorker):
             )
             self.progress.emit(i + 1, total, "")
         self.finished.emit(entries)
+
 
 
 class _LibraryPickerDialog(QDialog):
@@ -260,6 +262,7 @@ class _ManualResolveDialog(QDialog):
     def get_changes(self) -> dict:
         """Returns {orig_idx: new_path} for resolved entries, {orig_idx: None} for deletions."""
         return self._changes
+
 
 
 def _parse_m3u(playlist_path: Path) -> list[dict]:
@@ -483,9 +486,9 @@ class PlaylistTab(QWidget):
         dn_btn.clicked.connect(self._move_down)
         rm_miss_btn = QPushButton("Remove Missing")
         rm_miss_btn.clicked.connect(self._remove_missing)
-        resolve_btn = QPushButton("Resolve Missing")
-        resolve_btn.setToolTip("Find missing tracks by filename in the music library")
-        resolve_btn.clicked.connect(self._resolve_missing)
+        self._resolve_btn = QPushButton("Resolve Missing")
+        self._resolve_btn.setToolTip("Find missing tracks by filename in the music library")
+        self._resolve_btn.clicked.connect(self._resolve_missing)
         dedup_btn = QPushButton("Remove Duplicates")
         dedup_btn.clicked.connect(self._dedup)
         sort_lbl = QLabel("Sort:")
@@ -498,7 +501,7 @@ class PlaylistTab(QWidget):
         track_btns.addWidget(dn_btn)
         track_btns.addSpacing(12)
         track_btns.addWidget(rm_miss_btn)
-        track_btns.addWidget(resolve_btn)
+        track_btns.addWidget(self._resolve_btn)
         track_btns.addWidget(dedup_btn)
         track_btns.addSpacing(12)
         track_btns.addWidget(sort_lbl)
@@ -956,18 +959,23 @@ class PlaylistTab(QWidget):
         if not music_dir.exists():
             QMessageBox.warning(self, "No Music Directory", "Music directory not found.")
             return
-        skip = set(self.config.skip_dirs)
-        audio_exts = self.config.audio_extensions
-        by_stem: dict[str, list] = {}
-        for f in music_dir.rglob("*"):
-            if f.suffix.lower() in audio_exts and not (skip & set(f.relative_to(music_dir).parts)):
-                by_stem.setdefault(f.stem.lower(), []).append(f)
-        resolvable = []
-        for i, entry in missing:
-            stem = Path(entry["path"]).stem.lower()
-            candidates = by_stem.get(stem, [])
-            if len(candidates) == 1:
-                resolvable.append((i, str(candidates[0])))
+        self._resolve_btn.setEnabled(False)
+        self._add_progress.setRange(0, len(missing))
+        self._add_progress.setValue(0)
+        self._add_progress.setVisible(True)
+        self._resolve_worker = ResolveWorker(
+            missing, music_dir,
+            set(self.config.skip_dirs), self.config.audio_extensions,
+            self,
+        )
+        self._resolve_worker.progress.connect(lambda cur, _tot, _msg: self._add_progress.setValue(cur))
+        self._resolve_worker.finished.connect(self._on_resolve_done)
+        self._resolve_worker.start()
+
+    def _on_resolve_done(self, resolvable: list):
+        self._add_progress.setVisible(False)
+        self._resolve_btn.setEnabled(True)
+        missing = self._resolve_worker._missing
 
         if not resolvable:
             msg = QMessageBox(self)
