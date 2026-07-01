@@ -1,18 +1,26 @@
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QButtonGroup, QDialog, QFileDialog, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QRadioButton, QStackedWidget, QVBoxLayout, QWidget,
+    QButtonGroup,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QRadioButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
-from ..core.config import Config, LIBRARY_STRUCTURES, encrypt_password
+from ..core.config import LIBRARY_STRUCTURES, Config, encrypt_password
 from .styles import COLORS
-
 
 _STRUCTURE_DETAILS = {
     "artist/album": ("Artist + Album", "Organised by artist then album", "Artist / Album / song.mp3"),
-    "artist":       ("By Artist",      "One folder per artist",          "Artist / song.mp3"),
-    "flat":         ("Flat",           "Everything in one folder",       "song.mp3"),
+    "artist": ("By Artist", "One folder per artist", "Artist / song.mp3"),
+    "flat": ("Flat", "Everything in one folder", "song.mp3"),
 }
 
 _NEXT_LABELS = ["Get Started  →", "Next  →", "Next  →", "Open Music Manager"]
@@ -20,9 +28,7 @@ _NEXT_LABELS = ["Get Started  →", "Next  →", "Next  →", "Open Music Manage
 
 def _h(text: str, size: int = 18) -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet(
-        f"color:{COLORS['text_heading']}; font-size:{size}px; font-weight:600;"
-    )
+    lbl.setStyleSheet(f"color:{COLORS['text_heading']}; font-size:{size}px; font-weight:600;")
     return lbl
 
 
@@ -40,10 +46,7 @@ class _StepBar(QWidget):
         super().__init__(parent)
         self._current = 0
         self.setFixedHeight(46)
-        self.setStyleSheet(
-            f"background:{COLORS['bg_secondary']};"
-            f"border-bottom:1px solid {COLORS['border']};"
-        )
+        self.setStyleSheet(f"background:{COLORS['bg_secondary']};border-bottom:1px solid {COLORS['border']};")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(32, 0, 32, 0)
         lay.setSpacing(0)
@@ -97,10 +100,7 @@ class FirstRunWizard(QDialog):
 
         # ── Nav bar ──────────────────────────────────────────────────────────
         bar = QWidget()
-        bar.setStyleSheet(
-            f"background:{COLORS['bg_secondary']};"
-            f"border-top:1px solid {COLORS['border']};"
-        )
+        bar.setStyleSheet(f"background:{COLORS['bg_secondary']};border-top:1px solid {COLORS['border']};")
         nav = QHBoxLayout(bar)
         nav.setContentsMargins(24, 12, 24, 12)
 
@@ -132,22 +132,20 @@ class FirstRunWizard(QDialog):
         lay.setSpacing(10)
 
         lay.addWidget(_h("Welcome to Music Manager", 22))
-        lay.addWidget(_muted(
-            "A local-first desktop app for organising, syncing, and maintaining "
-            "your music collection. Everything stays on your machine — no accounts, "
-            "no cloud, no subscriptions."
-        ))
+        lay.addWidget(
+            _muted("A local-first desktop app for organising, syncing, and maintaining your music on device.")
+        )
         lay.addSpacing(10)
 
         lay.addWidget(QLabel("What you can do:"))
 
         for name, desc in [
-            ("Library",    "Browse and organise your local music files."),
-            ("Sync",       "Mirror your library to a NAS, server, or local folder."),
-            ("Download",   "Grab audio from YouTube, Bandcamp, and SoundCloud via yt-dlp."),
-            ("Playlists",  "Create and manage M3U playlists."),
+            ("Library", "Browse and organise your local music files."),
+            ("Sync", "Mirror your library to a share, or local folder."),
+            ("Download", "Grab audio from YouTube, Bandcamp, and SoundCloud via yt-dlp."),
+            ("Playlists", "Create and manage M3U playlists."),
             ("Duplicates", "Find duplicate tracks using acoustic fingerprinting."),
-            ("Re-encode",  "Convert files between MP3, FLAC, AAC, OGG, and more."),
+            ("Re-encode", "Convert files between MP3, FLAC, AAC, OGG, and more."),
         ]:
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -162,10 +160,9 @@ class FirstRunWizard(QDialog):
             lay.addLayout(row)
 
         lay.addStretch()
-        lay.addWidget(_muted(
-            "The next two steps cover the essentials. "
-            "Everything can be changed later in the Settings tab."
-        ))
+        lay.addWidget(
+            _muted("The next two steps cover the essentials. Everything can be changed later in the Settings tab.")
+        )
         return w
 
     def _page_library(self) -> QWidget:
@@ -189,10 +186,12 @@ class FirstRunWizard(QDialog):
         lay.addSpacing(6)
 
         lay.addWidget(QLabel("How should files be organised?"))
-        lay.addWidget(_muted(
-            "This controls where downloaded or re-encoded files are placed. "
-            "It has no effect on files already in your library."
-        ))
+        lay.addWidget(
+            _muted(
+                "This controls where downloaded or re-encoded files are placed. "
+                "It has no effect on files already in your library."
+            )
+        )
 
         self._struct_group = QButtonGroup(w)
 
@@ -227,10 +226,12 @@ class FirstRunWizard(QDialog):
         hdr.addStretch()
         lay.addLayout(hdr)
 
-        lay.addWidget(_muted(
-            "Music Manager can push or pull your library to a NAS, SMB server, "
-            "or any local folder. Leave this on None if you don't need it."
-        ))
+        lay.addWidget(
+            _muted(
+                "Music Manager can push or pull your library to a NAS, SMB server, "
+                "or any local folder. Leave this on None if you don't need it."
+            )
+        )
 
         lay.addSpacing(4)
 
@@ -303,10 +304,10 @@ class FirstRunWizard(QDialog):
         lay.addSpacing(8)
 
         for tab, tip in [
-            ("Library tab",    "Click Refresh to scan your music directory."),
-            ("Download tab",   "Paste a YouTube or SoundCloud URL to grab audio."),
+            ("Library tab", "Click Refresh to scan your music directory."),
+            ("Download tab", "Paste a YouTube or SoundCloud URL to grab audio."),
             ("Duplicates tab", "Run a scan after adding music to find accidental duplicates."),
-            ("Settings tab",   "Fine-tune skip directories, sync credentials, and more."),
+            ("Settings tab", "Fine-tune skip directories, sync credentials, and more."),
         ]:
             row = QHBoxLayout()
             arrow = QLabel("→")
@@ -369,9 +370,7 @@ class FirstRunWizard(QDialog):
             self.config.save()
         elif idx == 2:
             mode = next(
-                (btn.property("sync_value")
-                 for btn in self._sync_group.buttons()
-                 if btn.isChecked()),
+                (btn.property("sync_value") for btn in self._sync_group.buttons() if btn.isChecked()),
                 "none",
             )
             if mode != "none":
@@ -390,24 +389,18 @@ class FirstRunWizard(QDialog):
 
     def _update_sync_fields(self):
         mode = next(
-            (btn.property("sync_value")
-             for btn in self._sync_group.buttons()
-             if btn.isChecked()),
+            (btn.property("sync_value") for btn in self._sync_group.buttons() if btn.isChecked()),
             "none",
         )
         self._smb_widget.setVisible(mode == "server")
         self._folder_widget.setVisible(mode == "folder")
 
     def _browse_music_dir(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Music Directory", self._dir_edit.text()
-        )
+        path = QFileDialog.getExistingDirectory(self, "Select Music Directory", self._dir_edit.text())
         if path:
             self._dir_edit.setText(path)
 
     def _browse_folder_dest(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Sync Destination", self._folder_edit.text()
-        )
+        path = QFileDialog.getExistingDirectory(self, "Select Sync Destination", self._folder_edit.text())
         if path:
             self._folder_edit.setText(path)
