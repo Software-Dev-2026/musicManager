@@ -37,7 +37,6 @@ from ..workers.metadata_worker import NormalizeWorker, OrganizeWorker
 from .styles import COLORS, make_vdivider
 
 
-
 class _ScanThread(QThread):
     done = pyqtSignal(list)
 
@@ -66,70 +65,59 @@ class _ScanThread(QThread):
             self.done.emit(results)
             return
 
+        allPaths: list[tuple[str, str, Path]] = []
+        for item in sorted(self.music_dir.rglob("*")):
+            if self._cancelled:
+                return
+            if self.skip_dirs & set(item.relative_to(self.music_dir).parts):
+                continue
+            if item.is_file() and item.suffix.lower() in self.extensions:
+                rel: Path = item.relative_to(str(self.music_dir))
+                artist: str = "Misc"
+                album: str = ""
+                if len(rel.parts) == 3:
+                    artist = rel.parts[0]
+                    album = rel.parts[1]
+                if len(rel.parts) == 2:
+                    artist = rel.parts[0]
+                allPaths.append((artist, album, item))
+
         if self.structure == "flat":
             tracks = []
-            for item in sorted(self.music_dir.rglob("*")):
-                if self._cancelled:
-                    return
-                if self.skip_dirs & set(item.relative_to(self.music_dir).parts):
-                    continue
-                if item.is_file() and item.suffix.lower() in self.extensions:
-                    title, artist, missing = self._meta(item)
-                    tracks.append((title, str(item), missing))
+            for item in allPaths:
+                title, artist, missing = self._meta(item[2])
+                tracks.append((title, str(item), missing))
             results.append(("All Tracks", [], tracks))
-            flush_meta_cache()
-            self.done.emit(results)
-            return
+        elif self.structure == "artist":
+            d: dict[str, list[tuple[str, str, bool]]] = {}
+            for item in allPaths:
+                if item[0] not in d:
+                    d[item[0]] = []
+                title, artist, missing = self._meta(item[2])
+                d[item[0]].append((title, str(item), missing))
+            for k, v in d.items():
+                results.append((k, [], v))
+        else:
+            a: dict[str, dict[str, list[tuple[str, str, bool]]]] = {}
+            for item in allPaths:
+                artist = item[0]
+                album = item[1]
+                if artist not in a:
+                    a[artist] = {}
+                if album not in a[artist]:
+                    a[artist][album] = []
+                title, _artist, missing = self._meta(item[2])
+                a[artist][album].append((title, str(item), missing))
 
-        for artist_dir in sorted(self.music_dir.iterdir()):
-            if self._cancelled:
-                return
-            if not artist_dir.is_dir() or artist_dir.name in self.skip_dirs:
-                continue
-            albums = []
-            singles = []
-
-            if self.structure == "artist":
-                for child in sorted(artist_dir.rglob("*")):
-                    if self._cancelled:
-                        return
-                    if child.is_file() and child.suffix.lower() in self.extensions:
-                        title, _, missing = self._meta(child)
-                        singles.append((title, str(child), missing))
-            else:  # artist/album
-                for child in sorted(artist_dir.iterdir()):
-                    if self._cancelled:
-                        return
-                    if child.is_dir():
-                        songs = []
-                        for f in sorted(child.iterdir()):
-                            if self._cancelled:
-                                return
-                            if f.is_file() and f.suffix.lower() in self.extensions:
-                                title, _, missing = self._meta(f)
-                                songs.append((title, str(f), missing))
-                        if songs:
-                            albums.append((child.name, songs))
-                    elif child.is_file() and child.suffix.lower() in self.extensions:
-                        title, _, missing = self._meta(child)
-                        singles.append((title, str(child), missing))
-
-            results.append((artist_dir.name, albums, singles))
-
-        misc = []
-        for item in sorted(self.music_dir.iterdir()):
-            if self._cancelled:
-                return
-            if item.is_file() and item.suffix.lower() in self.extensions:
-                title, _, missing = self._meta(item)
-                misc.append((title, str(item), missing))
-        if misc:
-            for idx, (name, albums, singles) in enumerate(results):
-                if name == "Misc":
-                    results[idx] = ("Misc", albums, singles + misc)
-                    break
-            else:
-                results.append(("Misc", [], misc))
+            for artist, v in a.items():
+                albums: list[tuple[str, list[tuple[str, str, bool]]]] = []
+                singles: list[tuple[str, str, bool]] = []
+                for album, s in v.items():
+                    if album != "":
+                        albums.append((album, s))
+                    else:
+                        singles = s
+                results.append((artist, albums, singles))
 
         flush_meta_cache()
         self.done.emit(results)
