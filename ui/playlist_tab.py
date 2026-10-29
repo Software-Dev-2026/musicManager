@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
@@ -8,6 +9,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -27,7 +29,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.config import Config
-from ..core.downloader import decode_playlist
+from ..core.downloader import decode_path, decode_playlist
+from ..core.fsutil import atomic_write_text
 from ..core.metadata import read_quick_meta
 from ..workers.base_worker import BaseWorker
 from ..workers.resolve_worker import ResolveWorker
@@ -39,6 +42,8 @@ _MISS_COLOR = QColor(COLORS["error"])
 
 
 class _TrackInfoWorker(BaseWorker):
+    description = "reading track info"
+
     def __init__(self, paths: list[str], parent=None):
         super().__init__(parent)
         self._paths = paths
@@ -112,6 +117,69 @@ class _LibraryPickerDialog(QDialog):
                     paths.append(p)
         return paths
 
+
+
+class _EntryEditDialog(QDialog):
+    """Edit one playlist entry's path (typed or browsed) and title."""
+
+    def __init__(self, entry: dict, playlist_path: Path, audio_exts: set, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Playlist Entry")
+        self.resize(620, 0)
+        self._playlist_path = playlist_path
+        self._base = playlist_path.parent
+        self._audio_exts = audio_exts
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Path (absolute, or relative to the playlist's folder):"))
+        path_row = QHBoxLayout()
+        self._path_edit = QLineEdit(entry["path"])
+        self._path_edit.textChanged.connect(self._update_status)
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._browse)
+        path_row.addWidget(self._path_edit, 1)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+        self._status = QLabel("")
+        layout.addWidget(self._status)
+
+        layout.addWidget(QLabel("Title:"))
+        self._title_edit = QLineEdit(entry.get("title", ""))
+        layout.addWidget(self._title_edit)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+        self._ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+        self._update_status()
+
+    def resolved_path(self) -> Path:
+        text = self._path_edit.text().strip()
+        return _entry_path(self._playlist_path, text) if text else Path()
+
+    def title(self) -> str:
+        return self._title_edit.text().strip()
+
+    def _update_status(self, *_):
+        text = self._path_edit.text().strip()
+        self._ok_btn.setEnabled(bool(text))
+        if not text:
+            self._status.setText("")
+        elif self.resolved_path().is_file():
+            self._status.setText("✓ File found")
+            self._status.setStyleSheet(f"color: {COLORS['success']};")
+        else:
+            self._status.setText("✗ File not found — the entry will be marked missing")
+            self._status.setStyleSheet(f"color: {COLORS['warning']};")
+
+    def _browse(self):
+        current = self.resolved_path()
+        start = str(current if current.parent.is_dir() else self._base)
+        exts = " ".join(f"*{e}" for e in sorted(self._audio_exts))
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Track", start, f"Audio files ({exts});;All files (*)")
+        if path:
+            self._path_edit.setText(path)
 
 
 class _ManualResolveDialog(QDialog):
@@ -265,12 +333,22 @@ class _ManualResolveDialog(QDialog):
 
 
 
+def _entry_str(base: str, line: str) -> str:
+    """Absolute, normalised path for a playlist line (string ops only — no filesystem calls)."""
+    line = line.replace("\\", "/")
+    return os.path.normpath(line if os.path.isabs(line) else os.path.join(base, line))
+
+
+def _entry_path(playlist_path: Path, line: str) -> Path:
+    return Path(_entry_str(str(playlist_path.parent), line))
+
+
 def _parse_m3u(playlist_path: Path) -> list[dict]:
     try:
         raw = playlist_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return []
-    raw = decode_playlist(raw)
+    base = str(playlist_path.parent)
     entries, title, duration = [], None, -1
     for line in raw.splitlines():
         line = line.strip()
@@ -290,16 +368,26 @@ def _parse_m3u(playlist_path: Path) -> list[dict]:
         elif line.startswith("#"):
             continue
         else:
-            p = Path(line.replace("\\", "/"))
-            if not p.is_absolute():
-                p = (playlist_path.parent / p).resolve()
+            # Plain strings and one stat per entry: Path objects and resolve() made
+            # large playlists slow to open
+            path = _entry_str(base, line)
+            exists = os.path.exists(path)
+            if not exists and ("%" in line or line.startswith("file://")):
+                # URL-encoded entry: use the decoded form only if that file exists,
+                # so real filenames containing "%" are never mangled
+                try:
+                    decoded = _entry_str(base, decode_path(line))
+                except UnicodeDecodeError:
+                    decoded = path
+                if decoded != path and os.path.exists(decoded):
+                    path, exists = decoded, True
             entries.append(
                 {
                     "raw": line,
-                    "path": str(p),
-                    "title": title or p.stem,
+                    "path": path,
+                    "title": title or os.path.splitext(os.path.basename(path))[0],
                     "duration": duration,
-                    "exists": p.exists(),
+                    "exists": exists,
                 }
             )
             title, duration = None, -1
@@ -307,19 +395,23 @@ def _parse_m3u(playlist_path: Path) -> list[dict]:
 
 
 def _write_m3u(playlist_path: Path, entries: list[dict]) -> list[str]:
-    """Write entries to an M3U file. Returns a list of paths that could not be made relative."""
+    """Write entries to an M3U file with paths relative to it.
+
+    Entries outside the playlist's folder use "../" paths, or stay absolute when
+    no relative path exists (another drive). Returns the paths saved as absolute.
+    """
     base = playlist_path.parent
     lines = ["#EXTM3U"]
-    unresolvable = []
+    absolute = []
     for e in entries:
         lines.append(f"#EXTINF:{e.get('duration', -1)},{e.get('title', '')}")
         try:
-            lines.append(str(Path(e["path"]).relative_to(base)))
-        except ValueError:
-            unresolvable.append(e["path"])
-            lines.append(Path(e["path"]).name)
-    playlist_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return unresolvable
+            lines.append(os.path.relpath(e["path"], base))
+        except ValueError:  # different drive on Windows
+            absolute.append(e["path"])
+            lines.append(str(e["path"]))
+    atomic_write_text(playlist_path, "\n".join(lines) + "\n")
+    return absolute
 
 
 def _fmt_duration(total_secs: int) -> str:
@@ -444,6 +536,7 @@ class PlaylistTab(QWidget):
         self._track_list.setColumnWidth(3, 100)
         self._track_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._track_list.setAlternatingRowColors(True)
+        self._track_list.setUniformRowHeights(True)  # lets Qt skip measuring every row of big playlists
         self._track_list.setDragEnabled(True)
         self._track_list.setAcceptDrops(True)
         self._track_list.setDropIndicatorShown(True)
@@ -474,6 +567,9 @@ class PlaylistTab(QWidget):
         add_btn = self._add_btn
         rm_btn = QPushButton("Remove")
         rm_btn.clicked.connect(self._remove_selected)
+        edit_btn = QPushButton("Edit Entry…")
+        edit_btn.setToolTip("Change the selected entry's path or title (double-click also works)")
+        edit_btn.clicked.connect(self._edit_entry)
         up_btn = QPushButton()
         up_btn.setIcon(_style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
         up_btn.setFixedWidth(32)
@@ -497,6 +593,7 @@ class PlaylistTab(QWidget):
         self._sort_combo.currentIndexChanged.connect(self._sort_tracks)
         track_btns.addWidget(add_btn)
         track_btns.addWidget(rm_btn)
+        track_btns.addWidget(edit_btn)
         track_btns.addWidget(up_btn)
         track_btns.addWidget(dn_btn)
         track_btns.addSpacing(12)
@@ -575,7 +672,7 @@ class PlaylistTab(QWidget):
         if dest.exists():
             QMessageBox.warning(self, "Already Exists", f"{dest.name} already exists.")
             return
-        dest.write_text("#EXTM3U\n", encoding="utf-8")
+        atomic_write_text(dest, "#EXTM3U\n")
         self.scan_playlists()
         self._select_in_list(dest)
         self._load_playlist(dest)
@@ -660,15 +757,6 @@ class PlaylistTab(QWidget):
         # saving will rewrite them as relative paths.
         has_absolute = any(Path(e["raw"]).is_absolute() for e in self._entries)
         self._dirty = has_absolute
-        # Absolute paths that fall outside the library directory are unreachable;
-        # treat them as missing even if the file exists on disk.
-        music_dir = self.config.music_dir.resolve()
-        for e in self._entries:
-            if e["exists"] and Path(e["raw"]).is_absolute():
-                try:
-                    Path(e["path"]).resolve().relative_to(music_dir)
-                except ValueError:
-                    e["exists"] = False
         self._path_label.setText(str(path))
         self._fix_btn.setEnabled(True)
         self._sort_combo.blockSignals(True)
@@ -684,19 +772,26 @@ class PlaylistTab(QWidget):
         self._populate_track_list()
 
     def _populate_track_list(self):
-        self._track_list.clear()
         self._entries_snapshot = list(self._entries)
-        _handle_color = QColor("#484f58")
+        handle_color = QColor("#484f58")
+        items = []
         for i, e in enumerate(self._entries):
             status = "✓" if e["exists"] else "✗  Missing"
-            item = QTreeWidgetItem(self._track_list, ["⠿", str(i + 1), e["title"], status])
+            item = QTreeWidgetItem(["⠿", str(i + 1), e["title"], status])
             item.setData(0, Qt.ItemDataRole.UserRole, i)
             item.setToolTip(2, e["path"])
-            item.setForeground(0, _handle_color)
-            color = _OK_COLOR if e["exists"] else _MISS_COLOR
-            item.setForeground(3, color)
+            item.setForeground(0, handle_color)
+            item.setForeground(3, _OK_COLOR if e["exists"] else _MISS_COLOR)
             if not e["exists"]:
                 item.setForeground(2, _MISS_COLOR)
+            items.append(item)
+        # One batched insert with repaints paused, instead of a layout pass per row
+        self._track_list.setUpdatesEnabled(False)
+        try:
+            self._track_list.clear()
+            self._track_list.addTopLevelItems(items)
+        finally:
+            self._track_list.setUpdatesEnabled(True)
         self._update_stats()
 
     def _on_rows_moved(self, *_):
@@ -725,10 +820,32 @@ class PlaylistTab(QWidget):
         self._stats_label.setText(f"{n} tracks · {n - missing} found · {missing} missing · {_fmt_duration(total_secs)}")
 
     def _on_track_double_clicked(self, item: QTreeWidgetItem, _col: int):
-        path = self._entries[self._track_list.indexOfTopLevelItem(item)]["path"]
-        QMessageBox.information(self, "File Path", path)
+        self._edit_entry(item)
 
-    # ── Track editing ─────────────────────────────────────────────────────────
+    def _edit_entry(self, item: QTreeWidgetItem | None = None):
+        if self._playlist_path is None:
+            return
+        item = item or self._track_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Edit Entry", "Select a track to edit.")
+            return
+        row = self._track_list.indexOfTopLevelItem(item)
+        if not 0 <= row < len(self._entries):
+            return
+        entry = self._entries[row]
+        dlg = _EntryEditDialog(entry, self._playlist_path, self.config.audio_extensions, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_path, new_title = dlg.resolved_path(), dlg.title()
+        if str(new_path) == entry["path"] and new_title == entry.get("title", ""):
+            return
+        self._push_undo()
+        entry["path"] = str(new_path)
+        entry["exists"] = new_path.is_file()
+        entry["title"] = new_title or new_path.stem
+        self._mark_dirty()
+        self._populate_track_list()
+        self._track_list.setCurrentItem(self._track_list.topLevelItem(row))
 
     def _add_songs(self):
         if self._playlist_path is None:
@@ -749,13 +866,18 @@ class PlaylistTab(QWidget):
         self._add_progress.setVisible(True)
         self._add_worker = _TrackInfoWorker(paths, self)
         self._add_worker.progress.connect(lambda cur, _tot, _msg: self._add_progress.setValue(cur))
-        self._add_worker.finished.connect(self._on_add_done)
+        target = self._playlist_path
+        self._add_worker.finished.connect(lambda entries: self._on_add_done(entries, target))
         self._add_worker.start()
 
-    def _on_add_done(self, new_entries: list):
-        self._entries.extend(new_entries)
+    def _on_add_done(self, new_entries: list, target: Path | None = None):
         self._add_progress.setVisible(False)
         self._add_btn.setEnabled(True)
+        if target != self._playlist_path:
+            QMessageBox.information(self, "Tracks Not Added",
+                                    "The playlist was switched before the tracks finished loading; nothing was added.")
+            return
+        self._entries.extend(new_entries)
         self._mark_dirty()
         self._populate_track_list()
 
@@ -823,7 +945,7 @@ class PlaylistTab(QWidget):
         seen: set[str] = set()
         unique = []
         for e in self._entries:
-            key = e["path"].lower()
+            key = os.path.normcase(e["path"])  # case-insensitive only where the OS is
             if key not in seen:
                 seen.add(key)
                 unique.append(e)
@@ -856,6 +978,9 @@ class PlaylistTab(QWidget):
     def _fix_encoding(self):
         if not self._playlist_path:
             return
+        # This rewrites the file on disk and reloads it, which would drop unsaved edits
+        if not self.confirm_discard():
+            return
         try:
             original = self._playlist_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
@@ -873,32 +998,25 @@ class PlaylistTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self._playlist_path.write_text(fixed, encoding="utf-8")
+            atomic_write_text(self._playlist_path, fixed)
             self._load_playlist(self._playlist_path)
 
     def _save(self):
         if not self._playlist_path:
             return
         try:
-            unresolvable = _write_m3u(self._playlist_path, self._entries)
-            if unresolvable:
+            absolute = _write_m3u(self._playlist_path, self._entries)
+            if absolute:
                 QMessageBox.warning(
                     self,
                     "Save Warning",
-                    f"{len(unresolvable)} track(s) were outside the playlist directory and "
-                    f"have been saved as filename only:\n"
-                    + "\n".join(unresolvable[:5])
-                    + (f"\n… and {len(unresolvable) - 5} more" if len(unresolvable) > 5 else ""),
+                    f"{len(absolute)} track(s) are on a different drive from the playlist and "
+                    f"were saved with absolute paths:\n"
+                    + "\n".join(absolute[:5])
+                    + (f"\n… and {len(absolute) - 5} more" if len(absolute) > 5 else ""),
                 )
             # Reload from the written file so raw/path/exists reflect the saved state.
             self._entries = _parse_m3u(self._playlist_path)
-            music_dir = self.config.music_dir.resolve()
-            for e in self._entries:
-                if e["exists"] and Path(e["raw"]).is_absolute():
-                    try:
-                        Path(e["path"]).resolve().relative_to(music_dir)
-                    except ValueError:
-                        e["exists"] = False
             self._dirty = False
             self._save_btn.setVisible(False)
             self._save_status_label.setText("Saved")
@@ -968,12 +1086,26 @@ class PlaylistTab(QWidget):
             set(self.config.skip_dirs), self.config.audio_extensions,
             self,
         )
-        self._resolve_worker.progress.connect(lambda cur, _tot, _msg: self._add_progress.setValue(cur))
+        self._resolve_worker.progress.connect(self._on_resolve_progress)
         self._resolve_worker.finished.connect(self._on_resolve_done)
+        self._resolve_worker.error.connect(self._on_resolve_error)
         self._resolve_worker.start()
+
+    def _on_resolve_progress(self, cur: int, total: int, msg: str):
+        # Two phases (indexing the library, then matching), each with its own total
+        self._add_progress.setRange(0, max(total, 1))
+        self._add_progress.setValue(cur)
+        self._add_progress.setFormat(f"{msg} %p%" if msg else "%p%")
+
+    def _on_resolve_error(self, msg: str):
+        self._add_progress.setVisible(False)
+        self._add_progress.setFormat("%p%")
+        self._resolve_btn.setEnabled(True)
+        QMessageBox.critical(self, "Resolve Failed", msg)
 
     def _on_resolve_done(self, resolvable: list):
         self._add_progress.setVisible(False)
+        self._add_progress.setFormat("%p%")
         self._resolve_btn.setEnabled(True)
         missing = self._resolve_worker._missing
 
@@ -988,14 +1120,32 @@ class PlaylistTab(QWidget):
                 self._open_manual_resolve(missing)
             return
 
+        # Results carry indices from when the resolve started; map them back to the
+        # entry objects so edits made meanwhile can't redirect a match to another row.
+        by_index = dict(missing)
+        live = [(by_index[i], p, why) for i, p, why in resolvable
+                if i in by_index and any(e is by_index[i] for e in self._entries)]
+        if not live:
+            QMessageBox.information(self, "Resolve", "The playlist changed while resolving; run Resolve again.")
+            return
+        preview = "\n".join(f"{e['title']}\n    → {Path(p).name}   ({why})" for e, p, why in live[:15])
+        if len(live) > 15:
+            preview += f"\n… and {len(live) - 15} more"
+        reply = QMessageBox.question(
+            self, "Apply Matches?",
+            f"Found matches for {len(live)} missing track(s):\n\n{preview}\n\nApply them? (Undo is available.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         self._push_undo()
-        for i, new_path in resolvable:
-            self._entries[i]["path"] = new_path
-            self._entries[i]["exists"] = True
+        for entry, new_path, _why in live:
+            entry["path"] = new_path
+            entry["exists"] = True
         self._mark_dirty()
         self._populate_track_list()
 
-        resolved_idxs = {i for i, _ in resolvable}
+        resolved_idxs = {i for i, _, _ in resolvable}
         still_unresolved = [(i, e) for i, e in missing if i not in resolved_idxs]
         if still_unresolved:
             msg = QMessageBox(self)
@@ -1058,5 +1208,9 @@ class PlaylistTab(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        # Minimizing the window also sends a (spontaneous) hide event; only unload
+        # when the user really left the tab, and never with unsaved edits.
+        if event.spontaneous() or self._dirty:
+            return
         self._playlist_list.clearSelection()
         self._unload_playlist()

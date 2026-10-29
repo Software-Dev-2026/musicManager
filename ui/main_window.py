@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QDialog, QMainWindow, QTabWidget, QStatusBar, QLabel,
+    QApplication, QDialog, QMainWindow, QMessageBox, QTabWidget, QStatusBar, QLabel,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush
@@ -14,6 +14,7 @@ from .playlist_tab import PlaylistTab
 from .settings_tab import SettingsTab
 from .reencode_tab import ReencodeTab
 from ..core.config import Config
+from ..workers.base_worker import running_threads, stop_all
 
 _SVG_PATH = Path(__file__).parent.parent / "icon.svg"
 
@@ -60,6 +61,8 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect_cross_tab()
 
+        if self.config.load_error:
+            QTimer.singleShot(100, lambda: QMessageBox.warning(self, "Settings Could Not Be Read", self.config.load_error))
         if not self.config.get("setup_complete", False):
             QTimer.singleShot(150, self._show_first_run)
 
@@ -145,6 +148,32 @@ class MainWindow(QMainWindow):
         if not self.settings_tab.confirm_discard():
             event.ignore()
             return
+        running = running_threads()
+        if running:
+            names = sorted({getattr(t, "description", "background task") for t in running})
+            reply = QMessageBox.warning(
+                self,
+                "Operations Still Running",
+                "These are still running:\n  • " + "\n  • ".join(names)
+                + "\n\nStop them and quit? Each finishes the file it is working on first, "
+                "so nothing is left half-written.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.set_status("Stopping running operations…", 0)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                stopped = stop_all()
+            finally:
+                QApplication.restoreOverrideCursor()
+            if not stopped:
+                QMessageBox.warning(self, "Still Running",
+                                    "Some operations haven't finished yet. Try closing again in a moment.")
+                event.ignore()
+                return
         event.accept()
 
     def _show_first_run(self):

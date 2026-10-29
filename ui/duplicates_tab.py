@@ -1,3 +1,5 @@
+import csv
+import io
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
@@ -7,6 +9,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -21,8 +24,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..core import deleted_log
 from ..core.config import Config
+from ..core.fsutil import atomic_write_text
 from ..core.duplicates import check_fpcalc, delete_files, rank_group, resolve_deletions
+from ..core.playlists import update_playlists
 from ..workers.dupes_worker import DupesWorker
 from .styles import COLORS, OrderedListWidget
 
@@ -115,6 +121,11 @@ class DuplicatesTab(QWidget):
         self._delete_btn.setEnabled(False)
         self._delete_btn.clicked.connect(self._delete_selected)
 
+        self._export_btn = QPushButton("Export List…")
+        self._export_btn.setEnabled(False)
+        self._export_btn.setToolTip("Save the duplicate groups as a CSV file")
+        self._export_btn.clicked.connect(self._export_list)
+
         btn_row.addWidget(self._scan_btn)
         btn_row.addWidget(self._cancel_btn)
         btn_row.addSpacing(16)
@@ -122,6 +133,7 @@ class DuplicatesTab(QWidget):
         btn_row.addWidget(self._unselect_btn)
         btn_row.addWidget(self._delete_btn)
         btn_row.addStretch()
+        btn_row.addWidget(self._export_btn)
         layout.addLayout(btn_row)
 
         # Progress row
@@ -195,12 +207,11 @@ class DuplicatesTab(QWidget):
         self._worker.start()
 
     def _cancel(self):
+        # Scan unlocks in _on_done once the worker stops (it finishes the current file first)
         if self._worker:
             self._worker.cancel()
-        self._scan_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
-        self._progress_bar.setVisible(False)
-        self._eta_label.setVisible(False)
+        self._summary_label.setText("Cancelling…")
 
     def _on_progress(self, current: int, total: int, msg: str):
         if total > 0:
@@ -209,12 +220,16 @@ class DuplicatesTab(QWidget):
         if msg:
             self._eta_label.setText(msg)
 
-    def _on_done(self, groups: list):
-        self._groups = groups
+    def _on_done(self, groups: list | None):
         self._scan_btn.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._eta_label.setVisible(False)
+        if groups is None:
+            self._summary_label.setText("Scan cancelled.")
+            return
+        self._groups = groups
+        self._export_btn.setEnabled(bool(groups))
         self._results.clear()
         if not groups:
             self._summary_label.setText("No duplicates found.")
@@ -338,6 +353,36 @@ class DuplicatesTab(QWidget):
         self._results.blockSignals(False)
         self._recalc_checked_count()
 
+    def _export_list(self):
+        if not self._results.topLevelItemCount():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Duplicate List", str(Path.home() / "duplicates.csv"), "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["Group", "Rank", "Marked for deletion", "Format", "Size", "Path"])
+        for i in range(self._results.topLevelItemCount()):
+            group_item = self._results.topLevelItem(i)
+            group = group_item.text(0).split(" — ")[0]
+            for j in range(group_item.childCount()):
+                c = group_item.child(j)
+                writer.writerow([
+                    group, c.text(3), "yes" if c.checkState(0) == Qt.CheckState.Checked else "no",
+                    c.text(1), c.text(2), c.data(0, Qt.ItemDataRole.UserRole),
+                ])
+        try:
+            # utf-8-sig so spreadsheet apps detect the encoding of non-ASCII paths
+            atomic_write_text(Path(path), buf.getvalue(), encoding="utf-8-sig")
+        except OSError as e:
+            QMessageBox.critical(self, "Export Failed", str(e))
+            return
+        self._log.append(f"Exported {self._results.topLevelItemCount()} group(s) to {path}")
+
     def _unselect_all(self):
         self._results.blockSignals(True)
         for i in range(self._results.topLevelItemCount()):
@@ -360,10 +405,53 @@ class DuplicatesTab(QWidget):
                         paths.append(Path(val))
         return paths
 
+    def _unsafe_groups(self) -> list[str]:
+        """Groups where deleting the checked files would leave no copy on disk."""
+        unsafe = []
+        for i in range(self._results.topLevelItemCount()):
+            group_item = self._results.topLevelItem(i)
+            children = [group_item.child(j) for j in range(group_item.childCount())]
+            if not any(c.checkState(0) == Qt.CheckState.Checked for c in children):
+                continue
+            survivors = [
+                Path(c.data(0, Qt.ItemDataRole.UserRole))
+                for c in children
+                if c.checkState(0) != Qt.CheckState.Checked and c.data(0, Qt.ItemDataRole.UserRole)
+            ]
+            if not any(p.exists() for p in survivors):
+                unsafe.append(group_item.text(0).split(" — ")[0])
+        return unsafe
+
+    def _replacement_map(self) -> dict[Path, Path]:
+        """For each checked file, the best-ranked unchecked copy in its group that still exists."""
+        priority_dirs = list(self.config.dupes_priority_dirs)
+        result = {}
+        for i in range(self._results.topLevelItemCount()):
+            group_item = self._results.topLevelItem(i)
+            children = [group_item.child(j) for j in range(group_item.childCount())]
+            checked = [Path(c.data(0, Qt.ItemDataRole.UserRole)) for c in children
+                       if c.checkState(0) == Qt.CheckState.Checked and c.data(0, Qt.ItemDataRole.UserRole)]
+            kept = [Path(c.data(0, Qt.ItemDataRole.UserRole)) for c in children
+                    if c.checkState(0) != Qt.CheckState.Checked and c.data(0, Qt.ItemDataRole.UserRole)]
+            kept = [p for p in kept if p.exists()]
+            if checked and kept:
+                best = rank_group(kept, self.config.music_dir, priority_dirs)[0][0]
+                result.update({p: best for p in checked})
+        return result
+
     def _delete_selected(self):
         paths = self._collect_checked()
         if not paths:
             QMessageBox.information(self, "Nothing Selected", "Check files to delete first.")
+            return
+        unsafe = self._unsafe_groups()
+        if unsafe:
+            QMessageBox.warning(
+                self, "Would Delete Every Copy",
+                "In these groups every copy is checked, or the copy being kept no longer exists on disk:\n  "
+                + "\n  ".join(unsafe[:10]) + (f"\n  … and {len(unsafe) - 10} more" if len(unsafe) > 10 else "")
+                + "\n\nUncheck at least one existing copy in each group (or rescan) and try again.",
+            )
             return
         msg = f"Delete {len(paths)} file(s)?\n\n" + "\n".join(str(p) for p in paths[:8])
         if len(paths) > 8:
@@ -373,10 +461,26 @@ class DuplicatesTab(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        replacements = self._replacement_map()
+        snap = deleted_log.snapshot(paths)  # tags must be read before the files are gone
         errors = delete_files(paths)
+        deleted = {p for p in paths if not p.exists()}
+        try:
+            deleted_log.record_deleted(
+                {str(p): snap[str(p)] for p in deleted}, "Deleted in Duplicates",
+                {str(p): keep for p, keep in replacements.items() if p in deleted},
+            )
+        except OSError as e:
+            errors.append(f"deleted-songs log not updated — {e}")
+        # Playlists that referenced a deleted copy now point at the copy that was kept
+        _, pl_errors = update_playlists(
+            self.config.music_dir,
+            {p: keep for p, keep in replacements.items() if p in deleted},
+            set(self.config.skip_dirs),
+        )
+        errors += [f"playlist not updated — {e}" for e in pl_errors]
         if errors:
             QMessageBox.warning(self, "Errors", "\n".join(errors))
-        deleted = {p for p in paths if not p.exists()}
         self._log.append(f"Deleted {len(deleted)} file(s).")
         for e in errors:
             self._log.append(f"  ERROR: {e}")
@@ -442,6 +546,7 @@ class DuplicatesTab(QWidget):
             self._summary_label.setText(f"Found {total_groups} duplicate group(s) across {total_files} files.")
         else:
             self._summary_label.setText("No duplicates remaining.")
+            self._export_btn.setEnabled(False)
             self._auto_select_btn.setEnabled(False)
             self._unselect_btn.setEnabled(False)
 

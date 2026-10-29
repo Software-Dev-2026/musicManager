@@ -1,5 +1,7 @@
+import os
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 AUDIO_CODECS = {
     "mp3":  "libmp3lame",
@@ -40,8 +42,9 @@ QUALITY_PRESETS: dict[str, list] = {
         ("Quality 3",         ["-q:a", "3"]),
     ],
     "opus": [
-        ("320k", ["-b:a", "320k"]),
-        ("256k", ["-b:a", "256k"]),
+        # libopus caps at 256k per channel, so anything higher fails on mono sources
+        ("256k (best)", ["-b:a", "256k"]),
+        ("192k", ["-b:a", "192k"]),
         ("128k", ["-b:a", "128k"]),
     ],
     "wav": [
@@ -70,12 +73,51 @@ def detect_formats(root: Path, skip_dirs: set, extensions: set) -> dict:
     return counts
 
 
+# Explicit muxers so ffmpeg can write to a temp name whose extension isn't the target's
+_MUXERS = {"mp3": "mp3", "flac": "flac", "m4a": "ipod", "ogg": "ogg", "opus": "opus", "wav": "wav"}
+# Containers that can carry embedded cover art; others fail on a video stream
+_COVER_ART_FORMATS = {"mp3", "flac", "m4a"}
+
+
 def build_ffmpeg_cmd(src: Path, dst: Path, target_fmt: str, quality_args: list) -> list:
     codec = AUDIO_CODECS.get(target_fmt, "copy")
-    cmd = ["ffmpeg", "-i", str(src), "-c:a", codec]
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(src), "-map", "0:a"]
+    if target_fmt in _COVER_ART_FORMATS:
+        cmd += ["-map", "0:v?", "-c:v", "copy", "-disposition:v", "attached_pic"]
+    cmd += ["-c:a", codec]
     cmd += quality_args
-    cmd += ["-map_metadata", "0", "-y", str(dst)]
+    cmd += ["-map_metadata", "0"]
+    if target_fmt in _MUXERS:
+        cmd += ["-f", _MUXERS[target_fmt]]
+    cmd += ["-y", str(dst)]
     return cmd
+
+
+def _duration(path: Path, fmt: str | None = None) -> float | None:
+    """Duration via mutagen; fmt forces the parser (needed for temp files with no audio extension)."""
+    try:
+        import mutagen
+        from mutagen.flac import FLAC
+        from mutagen.mp3 import MP3
+        from mutagen.mp4 import MP4
+        from mutagen.oggopus import OggOpus
+        from mutagen.oggvorbis import OggVorbis
+        from mutagen.wave import WAVE
+        parser = {"mp3": MP3, "flac": FLAC, "m4a": MP4, "ogg": OggVorbis, "opus": OggOpus, "wav": WAVE}.get(fmt)
+        f = parser(path) if parser else mutagen.File(path)
+        # Not `if f`: a FileType is falsy when it has no tags
+        if f is None or getattr(f, "info", None) is None:
+            return None
+        return float(f.info.length) or None
+    except Exception:
+        return None
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def collect_reencoding_targets(
@@ -98,18 +140,61 @@ def reencode_file(
     target_fmt: str,
     quality_args: list,
     delete_original: bool = False,
+    source_root: Path | None = None,
+    cancel_fn: Callable[[], bool] | None = None,
 ) -> tuple[bool, str]:
-    dst_dir = output_dir if output_dir else src.parent
-    dst = (dst_dir / src.stem).with_suffix(f".{target_fmt}")
-    if dst == src:
-        dst = dst.with_stem(src.stem + "_reencoded")
+    """Encode src to target_fmt. Never overwrites an existing file.
 
-    cmd = build_ffmpeg_cmd(src, dst, target_fmt, quality_args)
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return False, result.stderr[-500:] if result.stderr else "ffmpeg error"
+    With output_dir, the file's folder structure below source_root is recreated
+    there so same-named tracks from different albums can't collide.
+    The original is only deleted after the output is verified.
+    """
+    if output_dir:
+        try:
+            dst_dir = output_dir / src.parent.relative_to(source_root) if source_root else output_dir
+        except ValueError:
+            dst_dir = output_dir
+    else:
+        dst_dir = src.parent
+    dst = dst_dir / f"{src.stem}.{target_fmt}"
+    if dst == src or _same_file(dst, src):
+        dst = dst_dir / f"{src.stem}_reencoded.{target_fmt}"
+    if dst.exists():
+        return False, f"Skipped — {dst} already exists"
 
-    if delete_original and dst.exists() and dst != src:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dst_dir / f".{dst.name}.reencodetmp"
+    cmd = build_ffmpeg_cmd(src, tmp, target_fmt, quality_args)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        while True:
+            try:
+                _, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_fn and cancel_fn():
+                    proc.kill()
+                    proc.communicate()
+                    tmp.unlink(missing_ok=True)
+                    return False, "Cancelled"
+        if proc.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            return False, stderr[-500:] if stderr else "ffmpeg error"
+
+        # Every target format is readable by mutagen, so an unreadable or empty output is a failure
+        src_len, out_len = _duration(src), _duration(tmp, target_fmt)
+        if not out_len or (src_len and abs(src_len - out_len) > max(1.0, src_len * 0.01)):
+            tmp.unlink(missing_ok=True)
+            return False, f"Output failed verification (duration {out_len}s vs source {src_len}s); original kept"
+        if dst.exists():
+            tmp.unlink(missing_ok=True)
+            return False, f"Skipped — {dst} appeared during encoding"
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    if delete_original and dst.exists() and not _same_file(dst, src):
         try:
             src.unlink()
         except Exception as e:

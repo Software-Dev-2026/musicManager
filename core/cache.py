@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from .config import _CACHE_DIR
+from .fsutil import atomic_write_text
 
 
 # ── Generic JSON helpers ──────────────────────────────────────────────────────
@@ -14,8 +15,7 @@ def load_json(path: Path) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data))
+    atomic_write_text(path, json.dumps(data))
 
 
 # ── Per-file metadata cache ───────────────────────────────────────────────────
@@ -26,12 +26,15 @@ def save_json(path: Path, data: dict) -> None:
 
 METADATA_CACHE_PATH = _CACHE_DIR / "metadata_cache.json"
 _metadata_cache: dict = {}
+_metadata_loaded = False
 
 
 def _load_meta_cache() -> dict:
-    global _metadata_cache
-    if not _metadata_cache:
+    # A flag, not `if not _metadata_cache`: an empty cache would otherwise be re-read from disk on every call
+    global _metadata_cache, _metadata_loaded
+    if not _metadata_loaded:
         _metadata_cache = load_json(METADATA_CACHE_PATH)
+        _metadata_loaded = True
     return _metadata_cache
 
 

@@ -5,6 +5,8 @@ from ..core.duplicates import find_duplicates, check_fpcalc
 
 
 class DupesWorker(BaseWorker):
+    description = "duplicate scan"
+
     def __init__(
         self, music_dir: Path, skip_dirs: set, extensions: set,
         cache_path: Path, threshold: float, no_cache: bool = False,
@@ -45,11 +47,10 @@ class DupesWorker(BaseWorker):
                 self.cache_path, self.threshold, self.no_cache, progress_cb,
                 cancel_fn=lambda: self._cancelled,
             )
-            if not self._cancelled:
-                self.finished.emit(groups)
+            # None signals "cancelled" so the UI only unlocks once the scan has really stopped
+            self.finished.emit(None if self._cancelled else groups)
         except Exception as e:
-            if not self._cancelled:
-                self.error.emit(str(e))
+            self.error.emit(str(e))
 
 
 def _fmt_eta(seconds: float) -> str:

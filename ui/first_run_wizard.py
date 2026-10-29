@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -7,6 +9,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QStackedWidget,
@@ -14,14 +17,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..core.config import LIBRARY_STRUCTURES, Config, encrypt_password
+from ..core.config import Config, encrypt_password
 from .styles import COLORS
-
-_STRUCTURE_DETAILS = {
-    "artist/album": ("Artist + Album", "Organised by artist then album", "Artist / Album / song.mp3"),
-    "artist": ("By Artist", "One folder per artist", "Artist / song.mp3"),
-    "flat": ("Flat", "Everything in one folder", "song.mp3"),
-}
 
 _NEXT_LABELS = ["Get Started  →", "Next  →", "Next  →", "Open Music Manager"]
 
@@ -185,28 +182,6 @@ class FirstRunWizard(QDialog):
 
         lay.addSpacing(6)
 
-        lay.addWidget(QLabel("How should files be organised?"))
-        lay.addWidget(
-            _muted(
-                "This controls where downloaded or re-encoded files are placed. "
-                "It has no effect on files already in your library."
-            )
-        )
-
-        self._struct_group = QButtonGroup(w)
-
-        for i, value in enumerate(LIBRARY_STRUCTURES):
-            label, desc, example = _STRUCTURE_DETAILS.get(value, (value, "", value))
-            rb = QRadioButton(label)
-            rb.setProperty("struct_value", value)
-            rb.setChecked(i == 0)  # default to first item
-            self._struct_group.addButton(rb)
-            lay.addWidget(rb)
-
-            detail = _muted(f"    {desc}  ·  {example}")
-            detail.setContentsMargins(22, 0, 0, 4)
-            lay.addWidget(detail)
-
         lay.addStretch()
         return w
 
@@ -362,11 +337,13 @@ class FirstRunWizard(QDialog):
         if idx == 1:
             d = self._dir_edit.text().strip()
             if d:
-                self.config.set("music_dir", d)
-            for btn in self._struct_group.buttons():
-                if btn.isChecked():
-                    self.config.set("library_structure", btn.property("struct_value"))
-                    break
+                path = Path(d).expanduser()
+                if path.is_absolute() and path.is_dir():
+                    self.config.set("music_dir", str(path))
+                else:
+                    QMessageBox.warning(self, "Music Directory",
+                                        f"'{d}' is not an existing folder; keeping {self.config.music_dir}.\n"
+                                        "You can change it later in Settings.")
             self.config.save()
         elif idx == 2:
             mode = next(
@@ -382,7 +359,12 @@ class FirstRunWizard(QDialog):
                 if self._smb_pass.text():
                     self.config.set("server.pass", encrypt_password(self._smb_pass.text()))
             elif mode == "folder":
-                self.config.set("folder_sync.destination", self._folder_edit.text())
+                dest = self._folder_edit.text().strip()
+                if dest and not Path(dest).expanduser().is_absolute():
+                    QMessageBox.warning(self, "Sync Destination",
+                                        "The sync destination must be an absolute path; it was not saved.")
+                else:
+                    self.config.set("folder_sync.destination", str(Path(dest).expanduser()) if dest else "")
             self.config.save()
 
     # ── Field helpers ─────────────────────────────────────────────────────────

@@ -53,6 +53,7 @@ class DownloadTab(QWidget):
         self.config = config
         self._queue: list[_QueueItem] = []
         self._active_worker: DownloadWorker | None = None
+        self._run_items: list | None = None  # items the current Start run may process (None = all)
         self._staging_files: list[Path] = []
         self._setup_ui()
         self._refresh_staging()
@@ -283,8 +284,8 @@ class DownloadTab(QWidget):
         layout.addWidget(commit_hdr)
 
         commit_desc = QLabel(
-            "Moves files from staging into the music library, organised into folders "
-            "based on their metadata tags and the current library structure setting."
+            "Moves files from staging into the music library, organised into "
+            "Artist / Album folders based on their metadata tags."
         )
         commit_desc.setObjectName("muted")
         commit_desc.setWordWrap(True)
@@ -339,7 +340,8 @@ class DownloadTab(QWidget):
     def _start_all(self):
         if self._active_worker and self._active_worker.isRunning():
             return
-        self._process_next(indices=None)
+        self._run_items = None  # every queued item
+        self._process_next()
 
     def _start_selected(self):
         if self._active_worker and self._active_worker.isRunning():
@@ -348,11 +350,13 @@ class DownloadTab(QWidget):
         if not rows:
             QMessageBox.information(self, "None Selected", "Select queue items first.")
             return
-        self._process_next(indices=rows)
+        # Remember the items themselves: rows shift if the queue is edited mid-run
+        self._run_items = [self._queue[r] for r in sorted(rows) if r < len(self._queue)]
+        self._process_next()
 
-    def _process_next(self, indices=None):
+    def _process_next(self):
         for i, item in enumerate(self._queue):
-            if indices is not None and i not in indices:
+            if self._run_items is not None and not any(item is x for x in self._run_items):
                 continue
             if item.status == "queued":
                 self._download_item(i, item)
@@ -362,7 +366,7 @@ class DownloadTab(QWidget):
 
     def _download_item(self, index: int, item: _QueueItem):
         item.status = "downloading"
-        self._update_queue_item(index, f"[downloading]  {item.url}")
+        self._update_queue_item(item, f"[downloading]  {item.url}")
         self._current_label.setText(item.url)
         self._progress_bar.setValue(0)
 
@@ -378,29 +382,38 @@ class DownloadTab(QWidget):
         self._active_worker = worker
         worker.progress.connect(lambda c, _t, _m: self._progress_bar.setValue(c))
         worker.log.connect(lambda msg: self._log.append(msg))
-        worker.finished.connect(lambda res: self._on_dl_done(index, item, res))
-        worker.error.connect(lambda msg: self._on_dl_error(index, item, msg))
+        worker.finished.connect(lambda res: self._on_dl_done(item, res))
+        worker.error.connect(lambda msg: self._on_dl_error(item, msg))
         worker.start()
 
-    def _on_dl_done(self, index: int, item: _QueueItem, result: dict):
+    def _on_dl_done(self, item: _QueueItem, result: dict):
         rc = result.get("returncode", 0)
-        item.status = "done" if rc == 0 else "error"
-        self._update_queue_item(index, f"[{'done' if rc == 0 else f'error rc={rc}'}]  {item.url}")
-        self._progress_bar.setValue(100 if rc == 0 else 0)
         self._current_label.setText("Idle")
+        if result.get("cancelled"):
+            item.status = "queued"
+            self._update_queue_item(item, f"[cancelled]  {item.url}")
+            self._progress_bar.setValue(0)
+            return  # don't start the next download after a cancel (e.g. app closing)
+        item.status = "done" if rc == 0 else "error"
+        self._update_queue_item(item, f"[{'done' if rc == 0 else f'error rc={rc}'}]  {item.url}")
+        self._progress_bar.setValue(100 if rc == 0 else 0)
         self._refresh_staging()
         self._process_next()
 
-    def _on_dl_error(self, index: int, item: _QueueItem, msg: str):
+    def _on_dl_error(self, item: _QueueItem, msg: str):
         item.status = "error"
-        self._update_queue_item(index, f"[error]  {item.url}")
+        self._update_queue_item(item, f"[error]  {item.url}")
         self._log.append(f"ERROR: {msg}")
         self._current_label.setText("Idle")
         self._process_next()
 
-    def _update_queue_item(self, index: int, text: str):
-        if index < self._queue_list.count():
-            self._queue_list.item(index).setText(text)
+    def _update_queue_item(self, item: _QueueItem, text: str):
+        # Look the row up by identity: rows shift when other items are removed mid-download
+        for row, queued in enumerate(self._queue):
+            if queued is item:
+                if row < self._queue_list.count():
+                    self._queue_list.item(row).setText(text)
+                return
 
     def _clear_completed(self):
         to_remove = [i for i, item in enumerate(self._queue) if item.status in ("done", "error")]
@@ -562,7 +575,6 @@ class DownloadTab(QWidget):
 
     def _do_commit(self, paths: list[Path]):
         music_dir = self.config.music_dir
-        structure = self.config.library_structure
         committed, errors = [], []
 
         for src in paths:
@@ -570,7 +582,7 @@ class DownloadTab(QWidget):
                 continue
             tags = read_tags(str(src))
             dest_dir = compute_dest_dir(
-                music_dir, structure,
+                music_dir,
                 tags.get("artist", ""),
                 tags.get("album", ""),
             )
@@ -612,9 +624,12 @@ class DownloadTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            errors = []
             for p in paths:
                 try:
                     p.unlink()
-                except Exception:
-                    pass
+                except Exception as e:
+                    errors.append(f"{p.name}: {e}")
+            if errors:
+                QMessageBox.warning(self, "Some Files Not Deleted", "\n".join(errors))
             self._refresh_staging()

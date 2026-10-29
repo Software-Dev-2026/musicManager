@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QAction
 
-from ..core.config import Config, LIBRARY_STRUCTURES, encrypt_password
+from ..core.config import Config, encrypt_password
 from .styles import COLORS, OrderedListWidget
 
 
@@ -83,7 +83,6 @@ class SettingsTab(QWidget):
         lib_form.addRow(skip_lbl, self._skip_dirs)
         lib_form.addRow("", skip_btns)
 
-        lib_form.addRow("Library Structure:", self._make_struct_combo())
 
         self._show_titles_cb = QCheckBox("Read title tags when scanning (slower, shows song names)")
         lib_form.addRow("", self._show_titles_cb)
@@ -207,20 +206,11 @@ class SettingsTab(QWidget):
         save_layout.addWidget(wizard_btn)
         outer.addWidget(save_bar)
 
-    def _make_struct_combo(self) -> QComboBox:
-        self._struct_combo = QComboBox()
-        for s in LIBRARY_STRUCTURES:
-            self._struct_combo.addItem(s.replace("/", " / "), s)
-        return self._struct_combo
-
     def _load_values(self):
         self._music_dir.setText(str(self.config.music_dir))
         self._skip_dirs.clear()
         for d in self.config.skip_dirs:
             self._skip_dirs.addItem(QListWidgetItem(d))
-        saved_struct = self.config.library_structure
-        if saved_struct in LIBRARY_STRUCTURES:
-            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved_struct))
         self._show_titles_cb.setChecked(self.config.show_titles)
         mode_idx = self._sync_mode_combo.findData(self.config.sync_mode)
         if mode_idx >= 0:
@@ -275,7 +265,6 @@ class SettingsTab(QWidget):
         self._music_dir.textChanged.connect(self._mark_dirty)
         self._skip_dirs.model().rowsInserted.connect(self._mark_dirty)
         self._skip_dirs.model().rowsRemoved.connect(self._mark_dirty)
-        self._struct_combo.currentIndexChanged.connect(self._mark_dirty)
         self._show_titles_cb.toggled.connect(self._mark_dirty)
         self._sync_mode_combo.currentIndexChanged.connect(self._mark_dirty)
         self._smb_host.textChanged.connect(self._mark_dirty)
@@ -320,11 +309,47 @@ class SettingsTab(QWidget):
         for item in self._skip_dirs.selectedItems():
             self._skip_dirs.takeItem(self._skip_dirs.row(item))
 
+    def _validate_paths(self) -> str | None:
+        """Return an error message if a path setting could point the app at the wrong files."""
+        music = Path(self._music_dir.text().strip()).expanduser()
+        if not self._music_dir.text().strip() or not music.is_absolute():
+            return "The music directory must be an absolute path."
+        if not music.is_dir():
+            return f"The music directory does not exist:\n{music}"
+        music = music.resolve()
+
+        def overlaps(p: Path) -> bool:
+            p = p.resolve()
+            return p == music or p.is_relative_to(music) or music.is_relative_to(p)
+
+        dest_text = self._folder_dest.text().strip()
+        if dest_text:
+            dest = Path(dest_text).expanduser()
+            if not dest.is_absolute():
+                return "The sync destination must be an absolute path."
+            if overlaps(dest):
+                return "The sync destination can't be the music directory, inside it, or contain it."
+        staging_text = self._dl_staging.text().strip()
+        staging = Path(staging_text).expanduser()
+        if not staging_text or not staging.is_absolute():
+            return "The download staging directory must be an absolute path."
+        if overlaps(staging):
+            return "The download staging directory can't be the music directory, inside it, or contain it."
+        if not self._fp_cache.text().strip() or not Path(self._fp_cache.text().strip()).expanduser().is_absolute():
+            return "The fingerprint cache must be an absolute file path."
+        return None
+
     def _save(self):
+        problem = self._validate_paths()
+        if problem:
+            QMessageBox.warning(self, "Invalid Setting", problem + "\n\nSettings were not saved.")
+            return
+        for edit in (self._music_dir, self._folder_dest, self._dl_staging, self._fp_cache):
+            if edit.text().strip():
+                edit.setText(str(Path(edit.text().strip()).expanduser()))
         self.config.set("music_dir", self._music_dir.text())
         self.config.set("skip_dirs",
                         [self._skip_dirs.item(i).text() for i in range(self._skip_dirs.count())])
-        self.config.set("library_structure", self._struct_combo.currentData())
         self.config.set("show_titles", self._show_titles_cb.isChecked())
         self.config.set("sync_mode", self._sync_mode_combo.currentData())
         self.config.set("server.host", self._smb_host.text())

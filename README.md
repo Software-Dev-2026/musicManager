@@ -7,7 +7,7 @@ A desktop application for managing a local music library. Built with Python and 
 ## Features
 
 ### Library
-Browse your music directory as a tree. Files are scanned for metadata tags (title, artist, album, duration). You can batch-edit tags, rename files, and reorganise the directory structure from within the app.
+Browse your music directory as a tree. Files are scanned for metadata tags (title, artist, album, duration). You can batch-edit tags, rename files, and reorganise files into `Artist / Album` folders from within the app.
 
 ### Download
 Paste a URL from YouTube, SoundCloud, Bandcamp, or any yt-dlp-supported source. The file downloads to a staging directory where you can review and edit the metadata before committing it to the library.
@@ -32,7 +32,7 @@ Batch-converts audio files to a target format using FFmpeg. Supports MP3, FLAC, 
 Creates and edits M3U playlists. Tracks can be added from the library browser, reordered, and removed. Unresolved paths (tracks that have moved) can be auto-resolved by matching filenames against the current library.
 
 ### Settings
-Configures the music directory, skip directories, library folder structure, sync credentials, fingerprint cache location and threshold, download staging directory, and re-encode defaults.
+Configures the music directory, skip directories, sync credentials, fingerprint cache location and threshold, download staging directory, and re-encode defaults.
 
 ---
 
@@ -101,7 +101,23 @@ python main.py
 
 Run from the project root. No install step is required.
 
-On first launch, a setup wizard walks through the minimum configuration: music directory, folder structure, and optional sync destination.
+On first launch, a setup wizard walks through the minimum configuration: music directory and optional sync destination. The library is always organised as `Artist / Album / track`.
+
+---
+
+## Tests
+
+The `tests/` folder holds regression tests for data safety: tag cleaning never cuts audio, sync never deletes or
+overwrites what it shouldn't, re-encoding never overwrites or loses originals, playlists survive saves and moves,
+config damage is never silent, and every song path change is logged.
+
+```
+pip install pytest
+pytest
+```
+
+Run from the project root. Tests that need real audio files are skipped if `ffmpeg` is not installed.
+The tests run against a throwaway home folder and never touch your real config, caches, or music.
 
 ---
 

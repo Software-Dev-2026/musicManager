@@ -1,9 +1,13 @@
 import base64
+import copy
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
+
+from .fsutil import atomic_write_text
 
 if sys.platform == "win32":
     CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / "musicmanager"
@@ -16,6 +20,12 @@ else:
     _CACHE_DIR = Path.home() / ".cache" / "musicmanager"
 
 CONFIG_PATH = CONFIG_DIR / "config.json"
+# User data that must survive cache clearing (e.g. the deleted-songs log)
+DATA_DIR = (
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "musicmanager"
+    if sys.platform not in ("win32", "darwin")
+    else CONFIG_DIR
+)
 
 _PW_KEY = b"MusicMgr2024XOR"
 
@@ -27,7 +37,6 @@ DEFAULTS: dict = {
     "fingerprint_threshold": 0.9,
     "dupes_priority_dirs": [],
     "dupes_priority_configured": False,
-    "library_structure": "artist/album",
     "show_titles": True,
     "sync_mode": "folder",
     "server": {
@@ -48,11 +57,10 @@ DEFAULTS: dict = {
     },
     "reencode": {
         "target_format": "mp3",
-        "quality_preset": "VBR V0",
+        "quality_preset": "VBR V0 (best)",
         "delete_originals": False,
         "output_dir": "",
     },
-    "format_rank": {".flac": 4, ".wav": 3, ".m4a": 2, ".mp3": 2, ".ogg": 1, ".opus": 1},
     "setup_complete": False,
 }
 
@@ -89,8 +97,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-LIBRARY_STRUCTURES = ["artist/album", "artist", "flat"]
-
 _MISSING = object()
 
 
@@ -99,6 +105,7 @@ class Config:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self._data: dict = {}
+        self.load_error: str | None = None
         self.load()
 
     def load(self):
@@ -106,16 +113,27 @@ class Config:
         if CONFIG_PATH.exists():
             try:
                 data = json.loads(CONFIG_PATH.read_text())
-            except Exception:
-                pass
-        self._data = _deep_merge(DEFAULTS, data)
+                if not isinstance(data, dict):
+                    raise ValueError("config root is not an object")
+            except Exception as e:
+                # Keep the unreadable file so the next save can't silently destroy the user's settings
+                backup = CONFIG_PATH.with_name(f"config.json.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+                try:
+                    CONFIG_PATH.replace(backup)
+                    self.load_error = (f"The settings file was unreadable ({e}).\n"
+                                       f"It was kept as {backup}; defaults are in use.")
+                except OSError:
+                    self.load_error = f"The settings file {CONFIG_PATH} is unreadable ({e}); defaults are in use."
+                print(f"musicmanager: {self.load_error}", file=sys.stderr)
+                data = {}
+        self._data = _deep_merge(copy.deepcopy(DEFAULTS), data)
 
     def save(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(self._data, indent=2))
+        # Atomic, and owner-only: the file holds the (merely obfuscated) SMB password
+        atomic_write_text(CONFIG_PATH, json.dumps(self._data, indent=2), mode=0o600)
 
     def reset(self):
-        self._data = _deep_merge({}, DEFAULTS)
+        self._data = copy.deepcopy(DEFAULTS)
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
@@ -162,10 +180,6 @@ class Config:
     @property
     def dupes_priority_dirs(self) -> list:
         return self.get("dupes_priority_dirs")
-
-    @property
-    def library_structure(self) -> str:
-        return self.get("library_structure")
 
     @property
     def show_titles(self) -> bool:

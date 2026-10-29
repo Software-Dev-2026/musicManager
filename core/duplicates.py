@@ -17,10 +17,13 @@ def check_fpcalc() -> bool:
 
 
 def fingerprint(path: Path) -> "tuple[float, list[int]] | None":
-    result = subprocess.run(
-        ["fpcalc", "-raw", "-length", "120", str(path)],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["fpcalc", "-raw", "-length", "120", str(path)],
+            capture_output=True, text=True, timeout=120,  # a corrupt file must not hang the scan
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     duration, fp = None, None
@@ -88,6 +91,10 @@ def find_duplicates(
             cache[key] = {"mtime": mtime, "duration": duration, "fingerprint": fp}
             entries.append((path, duration, fp))
 
+    # Drop entries for files that no longer exist so the cache doesn't grow forever.
+    # Files outside this scan (other music dirs, skipped folders) are kept if present.
+    for key in [k for k in cache if not Path(k).exists()]:
+        del cache[key]
     save_json(cache_path, cache)
 
     if cancel_fn and cancel_fn():

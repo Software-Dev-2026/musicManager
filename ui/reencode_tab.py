@@ -25,7 +25,7 @@ def _src_kbps(path: Path) -> int | None:
     try:
         import mutagen
         f = mutagen.File(path)
-        if f and hasattr(f, "info") and hasattr(f.info, "bitrate"):
+        if f is not None and hasattr(f, "info") and hasattr(f.info, "bitrate"):  # falsy when untagged
             return f.info.bitrate // 1000
     except Exception:
         pass
@@ -150,6 +150,9 @@ class ReencodeTab(QWidget):
         quality_row.addStretch()
         settings_layout.addLayout(quality_row)
         self._update_quality_combo()
+        saved_preset = self.config.get("reencode.quality_preset")
+        if saved_preset and self._quality_combo.findText(saved_preset) >= 0:
+            self._quality_combo.setCurrentIndex(self._quality_combo.findText(saved_preset))
 
         self._delete_cb = QCheckBox("Delete originals after reencode")
         self._delete_cb.setChecked(bool(self.config.get("reencode.delete_originals")))
@@ -235,7 +238,8 @@ class ReencodeTab(QWidget):
         fmt = self._fmt_combo.currentData() or "mp3"
         preset = self._quality_combo.currentText()
         self.config.set("reencode.target_format", fmt)
-        self.config.set("reencode.quality_preset", preset)
+        if preset:  # the combo is briefly empty while it is repopulated
+            self.config.set("reencode.quality_preset", preset)
         self.config.set("reencode.delete_originals", self._delete_cb.isChecked())
         self.config.save()
 
@@ -332,7 +336,7 @@ class ReencodeTab(QWidget):
         self._log.clear()
 
         self._worker = ReencodeWorker(
-            self._targets, fmt, quality_args, output_dir, delete
+            self._targets, fmt, quality_args, output_dir, delete, self.config.music_dir
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log.connect(lambda msg: self._log.append(msg))
@@ -357,8 +361,9 @@ class ReencodeTab(QWidget):
         self._targets.clear()
         self._targets_label.setText("Click 'Find Files' to see what would be reencoded")
         errors = results.get("errors", [])
+        heading = "Cancelled." if results.get("cancelled") else "Done."
         self._log.append(
-            f"\nDone. Reencoded: {results.get('done', 0)}  Errors: {len(errors)}"
+            f"\n{heading} Reencoded: {results.get('done', 0)}  Errors/skipped: {len(errors)}"
         )
         if errors:
             for e in errors:
@@ -366,13 +371,11 @@ class ReencodeTab(QWidget):
         self.reencode_completed.emit()
 
     def _cancel(self):
+        # Controls unlock in _on_done once the worker has actually stopped (ffmpeg is killed)
         if self._worker:
             self._worker.cancel()
-        self._start_btn.setEnabled(bool(self._targets))
         self._cancel_btn.setEnabled(False)
-        self._find_btn.setEnabled(True)
-        self._progress_bar.setVisible(False)
-        self._progress_label.setVisible(False)
+        self._progress_label.setText("Cancelling…")
 
     def _on_error(self, msg: str):
         self._start_btn.setEnabled(True)

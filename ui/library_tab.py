@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 
@@ -6,7 +7,6 @@ from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
-    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.cache import flush_meta_cache, get_cached_meta, set_cached_meta
-from ..core.config import LIBRARY_STRUCTURES, Config
+from ..core.config import Config
 from ..core.metadata import (
     clean_file_tags,
     compute_dest_dir,
@@ -33,21 +33,30 @@ from ..core.metadata import (
     sanitize_name,
     write_tags,
 )
+from ..core import deleted_log
+from ..core.playlists import update_playlists
+from ..workers.base_worker import track
 from ..workers.metadata_worker import NormalizeWorker, OrganizeWorker
 from .styles import COLORS, make_vdivider
 
 
 class _ScanThread(QThread):
     done = pyqtSignal(list)
+    missing_found = pyqtSignal(int)  # songs gone since the previous scan
 
-    def __init__(self, music_dir: Path, skip_dirs: set, extensions: set, structure: str, show_titles: bool):
+    def __init__(self, music_dir: Path, skip_dirs: set, extensions: set, show_titles: bool):
         super().__init__()
         self.music_dir = music_dir
         self.skip_dirs = skip_dirs
         self.extensions = extensions
-        self.structure = structure
         self.show_titles = show_titles
         self._cancelled = False
+        track(self)
+
+    description = "library scan"
+
+    def cancel(self):
+        self._cancelled = True
 
     def _meta(self, path: Path) -> tuple[str, str, bool]:
         if self.show_titles:
@@ -65,68 +74,48 @@ class _ScanThread(QThread):
             self.done.emit(results)
             return
 
-        allPaths: list[tuple[str, str, Path]] = []
+        # artist → album → [(title, path, missing)]; album "" holds files directly in the artist folder.
+        # Files directly in the music folder are grouped under "Misc"; deeper folders
+        # (e.g. Artist/Album/CD1/track) belong to the album above them.
+        tree: dict[str, dict[str, list[tuple[str, str, bool]]]] = {}
+        seen: dict[str, dict] = {}  # baseline for the deleted-songs log
         for item in sorted(self.music_dir.rglob("*")):
             if self._cancelled:
                 return
-            if self.skip_dirs & set(item.relative_to(self.music_dir).parts):
+            rel = item.relative_to(self.music_dir)
+            if self.skip_dirs & set(rel.parts):
                 continue
-            if item.is_file() and item.suffix.lower() in self.extensions:
-                rel: Path = item.relative_to(str(self.music_dir))
-                artist: str = "Misc"
-                album: str = ""
-                if len(rel.parts) == 3:
-                    artist = rel.parts[0]
-                    album = rel.parts[1]
-                if len(rel.parts) == 2:
-                    artist = rel.parts[0]
-                allPaths.append((artist, album, item))
+            if not (item.is_file() and item.suffix.lower() in self.extensions):
+                continue
+            artist = rel.parts[0] if len(rel.parts) >= 2 else "Misc"
+            album = rel.parts[1] if len(rel.parts) >= 3 else ""
+            title, tag_artist, missing = self._meta(item)
+            tree.setdefault(artist, {}).setdefault(album, []).append((title, str(item), missing))
+            try:
+                size = item.stat().st_size
+            except OSError:
+                size = None
+            seen[str(item)] = {"title": title, "artist": tag_artist, "album": album, "size": size}
 
-        if self.structure == "flat":
-            tracks = []
-            for item in allPaths:
-                title, artist, missing = self._meta(item[2])
-                tracks.append((title, str(item), missing))
-            results.append(("All Tracks", [], tracks))
-        elif self.structure == "artist":
-            d: dict[str, list[tuple[str, str, bool]]] = {}
-            for item in allPaths:
-                if item[0] not in d:
-                    d[item[0]] = []
-                title, artist, missing = self._meta(item[2])
-                d[item[0]].append((title, str(item), missing))
-            for k, v in d.items():
-                results.append((k, [], v))
-        else:
-            a: dict[str, dict[str, list[tuple[str, str, bool]]]] = {}
-            for item in allPaths:
-                artist = item[0]
-                album = item[1]
-                if artist not in a:
-                    a[artist] = {}
-                if album not in a[artist]:
-                    a[artist][album] = []
-                title, _artist, missing = self._meta(item[2])
-                a[artist][album].append((title, str(item), missing))
-
-            for artist, v in a.items():
-                albums: list[tuple[str, list[tuple[str, str, bool]]]] = []
-                singles: list[tuple[str, str, bool]] = []
-                for album, s in v.items():
-                    if album != "":
-                        albums.append((album, s))
-                    else:
-                        singles = s
-                results.append((artist, albums, singles))
+        for artist, by_album in tree.items():
+            albums = [(album, songs) for album, songs in by_album.items() if album]
+            results.append((artist, albums, by_album.get("", [])))
 
         flush_meta_cache()
+        try:
+            gone = deleted_log.reconcile(self.music_dir, self.skip_dirs, seen)
+        except OSError:
+            gone = 0
         self.done.emit(results)
+        if gone:
+            self.missing_found.emit(gone)
 
 
 class LibraryTree(QTreeWidget):
     """Reusable tree widget for browsing the music library."""
 
     file_activated = pyqtSignal(str)
+    missing_found = pyqtSignal(int)
     file_opened = pyqtSignal(str)
     scan_complete = pyqtSignal()
 
@@ -145,7 +134,7 @@ class LibraryTree(QTreeWidget):
 
     def refresh(self):
         if self._thread is not None:
-            self._thread._cancelled = True
+            self._thread.cancel()  # still referenced by the worker registry until it exits
             try:
                 self._thread.done.disconnect(self._populate)
             except (TypeError, RuntimeError):
@@ -157,28 +146,16 @@ class LibraryTree(QTreeWidget):
             self.config.music_dir,
             set(self.config.skip_dirs),
             self.config.audio_extensions,
-            self.config.library_structure,
             self.config.show_titles,
         )
         thread.done.connect(self._populate)
+        thread.missing_found.connect(self.missing_found)
         thread.start()
         self._thread = thread
 
     def _populate(self, results: list):
         self.clear()
-        structure = self.config.library_structure
         warn_brush = QBrush(QColor(COLORS["warning"]))
-
-        if structure == "flat":
-            if results:
-                for title, filepath, missing in results[0][2]:
-                    item = QTreeWidgetItem(self, [title])
-                    item.setData(0, Qt.ItemDataRole.UserRole, filepath)
-                    if missing:
-                        item.setForeground(0, warn_brush)
-                        item.setToolTip(0, "Missing title or artist metadata")
-            self.scan_complete.emit()
-            return
 
         for artist_name, albums, singles in results:
             artist_item = QTreeWidgetItem(self, [artist_name])
@@ -257,6 +234,7 @@ class LibraryTab(QWidget):
         self.config = config
         self._current_file: str | None = None
         self._worker: NormalizeWorker | None = None
+        self._batch_active = False
         self._setup_ui()
         self.refresh()
 
@@ -290,18 +268,6 @@ class LibraryTab(QWidget):
         self._search.textChanged.connect(self._filter_tree)
         layout.addWidget(self._search)
 
-        struct_row = QHBoxLayout()
-        struct_row.addWidget(QLabel("View:"))
-        self._struct_combo = QComboBox()
-        for s in LIBRARY_STRUCTURES:
-            self._struct_combo.addItem(s.replace("/", " / "), s)
-        saved = self.config.library_structure
-        if saved in LIBRARY_STRUCTURES:
-            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved))
-        self._struct_combo.currentIndexChanged.connect(self._on_struct_change)
-        struct_row.addWidget(self._struct_combo, 1)
-        layout.addLayout(struct_row)
-
         self._tree = LibraryTree(self.config, compact=True)
         self._tree.file_activated.connect(self.load_file)
         self._tree.scan_complete.connect(lambda: self._status_label.setText(str(self.config.music_dir)))
@@ -316,7 +282,22 @@ class LibraryTab(QWidget):
         refresh_btn.clicked.connect(self.refresh)
         layout.addWidget(refresh_btn)
 
+        deleted_btn = QPushButton("Deleted Songs…")
+        deleted_btn.setToolTip("Songs deleted in the app or found missing since an earlier scan")
+        deleted_btn.clicked.connect(self._show_deleted)
+        layout.addWidget(deleted_btn)
+        self._tree.missing_found.connect(self._on_missing_found)
+
         return left
+
+    def _on_missing_found(self, count: int):
+        self._status_label.setText(
+            f"{self.config.music_dir}\n⚠ {count} song(s) moved or went missing since the last scan — see Deleted Songs."
+        )
+
+    def _show_deleted(self):
+        from .deleted_songs_dialog import DeletedSongsDialog
+        DeletedSongsDialog(self).exec()
 
     def _build_right_panel(self) -> QWidget:
         right = QWidget()
@@ -475,18 +456,8 @@ class LibraryTab(QWidget):
 
     def refresh(self):
         self._status_label.setText("Scanning…")
-        saved = self.config.library_structure
-        if saved in LIBRARY_STRUCTURES:
-            self._struct_combo.blockSignals(True)
-            self._struct_combo.setCurrentIndex(LIBRARY_STRUCTURES.index(saved))
-            self._struct_combo.blockSignals(False)
         self._tree.config = self.config
         self._tree.refresh()
-
-    def _on_struct_change(self, _idx: int):
-        self.config.set("library_structure", self._struct_combo.currentData())
-        self.config.save()
-        self.refresh()
 
     def _filter_tree(self, text: str):
         self._tree.filter(text)
@@ -524,8 +495,9 @@ class LibraryTab(QWidget):
         br = tags.get("_bitrate", 0)
         self._info_labels["bitrate"].setText(f"{br // 1000} kbps" if br else "—")
 
-        self._save_btn.setEnabled(True)
-        self._clean_btn.setEnabled(True)
+        # A running normalize/organize may be writing or moving this very file
+        self._save_btn.setEnabled(not self._batch_active)
+        self._clean_btn.setEnabled(not self._batch_active)
         self._reload_btn.setEnabled(True)
 
     # ── Tag actions ───────────────────────────────────────────────────────────
@@ -555,7 +527,6 @@ class LibraryTab(QWidget):
         return (
             compute_dest_dir(
                 self.config.music_dir,
-                self.config.library_structure,
                 tags.get("artist", ""),
                 tags.get("album", ""),
             )
@@ -573,7 +544,8 @@ class LibraryTab(QWidget):
 
         current = Path(self._current_file)
         dest = self._dest_path(current, tags)
-        if dest == current:
+        # samefile also covers symlinked music dirs and case-insensitive filesystems
+        if dest == current or (dest.exists() and os.path.samefile(dest, current)):
             self._show_saved()
             self.refresh()
             return
@@ -593,6 +565,15 @@ class LibraryTab(QWidget):
             moved = True
         except Exception as e:
             QMessageBox.warning(self, "Saved (Move Failed)", f"Tags saved but could not move file:\n{e}")
+        if moved:
+            try:
+                deleted_log.record_moves({current: dest}, "Moved after tag edit")
+            except OSError:
+                pass
+            _, pl_errors = update_playlists(self.config.music_dir, {current: dest}, set(self.config.skip_dirs))
+            if pl_errors:
+                QMessageBox.warning(self, "Playlists Not Updated",
+                                    "The file moved, but these playlists couldn't be updated:\n" + "\n".join(pl_errors))
         if moved:
             self._show_saved("Saved — file moved")
         self.refresh()
@@ -619,8 +600,11 @@ class LibraryTab(QWidget):
         return bool(self._worker and self._worker.isRunning())
 
     def _start_batch(self):
+        self._batch_active = True
         self._batch_btn.setEnabled(False)
         self._organize_btn.setEnabled(False)
+        self._save_btn.setEnabled(False)
+        self._clean_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._batch_progress.setVisible(True)
         self._batch_progress.setValue(0)
@@ -628,6 +612,19 @@ class LibraryTab(QWidget):
 
     def _batch_normalize(self):
         if self._is_batch_running():
+            return
+        reply = QMessageBox.warning(
+            self,
+            "Normalize Tags from Folders",
+            f"This rewrites the artist and album tags of every file in\n{self.config.music_dir}\n"
+            "to match the Artist / Album folder names.\n\n"
+            "Tags that already correspond to the folder are kept. Files are also cleaned "
+            "(duplicate ID3 tags and APE tags removed, MP3s converted to ID3v2.3).\n\n"
+            "This edits files in place. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
             return
         self._start_batch()
         self._worker = NormalizeWorker(
@@ -657,7 +654,6 @@ class LibraryTab(QWidget):
         self._start_batch()
         self._worker = OrganizeWorker(
             self.config.music_dir,
-            self.config.library_structure,
             set(self.config.skip_dirs),
             self.config.audio_extensions,
         )
@@ -673,8 +669,11 @@ class LibraryTab(QWidget):
             self._batch_progress.setValue(current)
 
     def _finish_batch(self):
+        self._batch_active = False
         self._batch_btn.setEnabled(True)
         self._organize_btn.setEnabled(True)
+        self._save_btn.setEnabled(bool(self._current_file))
+        self._clean_btn.setEnabled(bool(self._current_file))
         self._cancel_btn.setEnabled(False)
         self._batch_progress.setVisible(False)
 
@@ -700,14 +699,18 @@ class LibraryTab(QWidget):
         self._batch_log.append(f"ERROR: {msg}")
 
     def _cancel_batch(self):
+        # Controls unlock when the worker reports back (it stops after the current file)
         if self._worker:
             self._worker.cancel()
-        self._finish_batch()
+        self._cancel_btn.setEnabled(False)
+        self._batch_log.append("Cancelling…")
 
     # ── Tab visibility ────────────────────────────────────────────────────────
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        if event.spontaneous():  # window minimized — keep any unsaved edits in the form
+            return
         self._tree.clearSelection()
         self._current_file = None
         self._file_label.setText("Select a file from the library")
